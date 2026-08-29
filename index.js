@@ -2326,6 +2326,51 @@ export const TOOL_DEFINITIONS = [
 ]; // end TOOL_DEFINITIONS
 
 // ---------------------------------------------------------------------------
+// Production tool permissions
+// ---------------------------------------------------------------------------
+
+// Deny by default. Adding a tool definition or dispatch case does not make it
+// available to MCP clients: it must be named here as well. This intentionally
+// includes only ordinary CRM reporting plus the two approved write operations.
+export const APPROVED_TOOL_NAMES = Object.freeze([
+  // Server metadata
+  'about', 'help',
+
+  // CRM reporting
+  'listEvents', 'getEvent',
+  'listPeople', 'getPerson', 'checkDuplicate', 'listUnclaimed',
+  'getPersonAttachment', 'listRelationships', 'getRelationship',
+  'getIdentity', 'getCurrentUser',
+  'listNotes', 'getNote',
+  'listCalls', 'getCall',
+  'listTextMessages', 'getTextMessage',
+  'listUsers', 'getUser',
+  'listSmartLists', 'getSmartList',
+  'listActionPlans', 'listActionPlansPeople',
+  'listAutomations', 'getAutomation', 'listAutomationsPeople', 'getAutomationPerson',
+  'listTemplates', 'getTemplate', 'listTextMessageTemplates', 'getTextMessageTemplate',
+  'listEmEvents', 'listEmCampaigns',
+  'listCustomFields', 'getCustomField',
+  'listStages', 'getStage',
+  'listTasks', 'getTask',
+  'listAppointments', 'getAppointment',
+  'listAppointmentTypes', 'getAppointmentType',
+  'listAppointmentOutcomes', 'getAppointmentOutcome',
+  'listDeals', 'getDeal', 'getDealAttachment', 'listDealCustomFields', 'getDealCustomField',
+  'listTimeframes', 'getReactions', 'getThreadedReplies',
+  'getPersonByEmail', 'searchPeopleByTag', 'listAvailableTags',
+
+  // Approved writes
+  'createNote', 'createTask'
+]);
+
+const APPROVED_TOOL_NAME_SET = new Set(APPROVED_TOOL_NAMES);
+
+export function isToolAllowed(name) {
+  return APPROVED_TOOL_NAME_SET.has(name);
+}
+
+// ---------------------------------------------------------------------------
 // Tool Handler
 // ---------------------------------------------------------------------------
 
@@ -2335,6 +2380,9 @@ export async function handleToolCall(name, rawArgs) {
   // handleToolCall directly and never pass through createServer's request handler.
   if (FUB_SAFE_MODE && isDeleteTool(name)) {
     throw new Error('This tool is disabled in Safe Mode. To enable delete operations, set FUB_SAFE_MODE=false.');
+  }
+  if (!isToolAllowed(name)) {
+    throw new Error(`This tool is not approved for production use: ${name}`);
   }
   const args = stripMetaParams(rawArgs);
   try {
@@ -3221,24 +3269,24 @@ export function isDeleteTool(name) {
   return n.startsWith('delete') || name === 'inboxAppDeleteParticipant' || name === 'deleteReaction';
 }
 
-export const activeTools = FUB_SAFE_MODE
-  ? TOOL_DEFINITIONS.filter(t => !isDeleteTool(t.name))
-  : TOOL_DEFINITIONS;
+// Safe Mode remains a second, independent control on top of the allowlist.
+export const activeTools = TOOL_DEFINITIONS.filter(t =>
+  isToolAllowed(t.name) && (!FUB_SAFE_MODE || !isDeleteTool(t.name))
+);
 
 /**
  * Create an MCP Server with the FUB tool surface.
  *
  * @param {object} [opts]
- * @param {Array} [opts.extraTools] - Additional tool definitions to merge with the
- *   built-in TOOL_DEFINITIONS. Used by private deployments that layer custom tools
- *   (e.g., cookie-auth messaging) on top of the public API-key tool surface.
- * @param {Function} [opts.extraHandler] - async (name, args) => result. Called for
- *   any tool name not in the built-in handler. Throw to propagate as error.
+ * @param {Array} [opts.extraTools] - Retained for API compatibility. Extra tools
+ *   are deliberately not registered by this production server.
+ * @param {Function} [opts.extraHandler] - Retained for API compatibility and not
+ *   invoked by this production server.
  * @param {object} [opts.serverInfo] - Override name/version/description in the MCP
  *   server handshake. Useful for private deployments that want to identify themselves.
  */
 export function createServer(opts = {}) {
-  const { extraTools = [], extraHandler = null, serverInfo = {} } = opts;
+  const { serverInfo = {} } = opts;
 
   const server = new Server(
     {
@@ -3249,20 +3297,14 @@ export function createServer(opts = {}) {
     { capabilities: { tools: {} } }
   );
 
-  // Active built-in tools (filtered for SAFE MODE) + any caller-supplied extras.
-  // Extras are NOT auto-filtered by SAFE MODE -- caller decides per-tool.
-  const extendedTools = [...activeTools, ...extraTools];
-  const extraToolNames = new Set(extraTools.map(t => t.name));
-
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: extendedTools
+    tools: activeTools
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
-    // Defense-in-depth: also block here before dispatch. handleToolCall enforces
-    // the same rule for built-ins; this additionally guards the extraHandler path
-    // and returns a clean structured error without invoking the dispatcher.
+    // Defense-in-depth: Safe Mode stays checked here as well as in the built-in
+    // dispatcher, and the dispatcher independently enforces the allowlist.
     if (FUB_SAFE_MODE && isDeleteTool(name)) {
       return {
         content: [{ type: 'text', text: JSON.stringify({ error: 'This tool is disabled in Safe Mode. To enable delete operations, set FUB_SAFE_MODE=false.' }, null, 2) }],
@@ -3270,12 +3312,7 @@ export function createServer(opts = {}) {
       };
     }
     try {
-      let result;
-      if (extraToolNames.has(name) && extraHandler) {
-        result = await extraHandler(name, args || {});
-      } else {
-        result = await handleToolCall(name, args || {});
-      }
+      const result = await handleToolCall(name, args || {});
       return {
         content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
       };

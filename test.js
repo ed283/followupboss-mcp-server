@@ -70,10 +70,10 @@ async function run() {
   try {
     const result = await client.listTools();
     tools = result.tools;
-    if (tools.length >= 130) {
-      ok(`Lists ${tools.length} tools`);
+    if (tools.length === 60) {
+      ok(`Lists ${tools.length} approved tools`);
     } else {
-      fail(`Lists tools`, `Expected 130+, got ${tools.length}`);
+      fail(`Lists approved tools`, `Expected 60, got ${tools.length}`);
     }
   } catch (err) {
     fail('Lists tools', err.message);

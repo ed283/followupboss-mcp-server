@@ -3,7 +3,9 @@
  * Verify public can be imported and extended with an overlay.
  * This is the contract that the private repo (fub-mcp) relies on.
  */
-import { createServer, startStdio, startHttp, activeTools, TOOL_DEFINITIONS, FUB_SAFE_MODE, handleToolCall } from '../index.js';
+process.env.FUB_API_KEY = process.env.FUB_API_KEY || 'fka_test';
+
+const { createServer, startStdio, startHttp, activeTools, TOOL_DEFINITIONS, FUB_SAFE_MODE, handleToolCall } = await import('../index.js');
 
 let pass = 0, fail = 0;
 const ok = (l) => { pass++; console.log(`  PASS  ${l}`); };
@@ -22,7 +24,7 @@ else bad('startHttp', typeof startHttp);
 if (typeof handleToolCall === 'function') ok('handleToolCall is exported function');
 else bad('handleToolCall', typeof handleToolCall);
 
-if (Array.isArray(activeTools) && activeTools.length > 100) ok(`activeTools is array (${activeTools.length} tools)`);
+if (Array.isArray(activeTools) && activeTools.length > 0) ok(`activeTools is array (${activeTools.length} tools)`);
 else bad('activeTools', typeof activeTools);
 
 if (Array.isArray(TOOL_DEFINITIONS) && TOOL_DEFINITIONS.length >= 160) ok(`TOOL_DEFINITIONS has ${TOOL_DEFINITIONS.length} tools`);
@@ -36,7 +38,8 @@ const s1 = createServer();
 if (s1 && typeof s1.connect === 'function') ok('createServer() returns Server instance');
 else bad('createServer no-opts', s1);
 
-// 3. createServer({ extraTools, extraHandler }) accepts overlay
+// 3. Private overlay hooks remain accepted for import compatibility, but are
+// deliberately not executable through this hardened production server.
 const fakeOverlay = {
   extraTools: [
     { name: 'overlayDemo', description: 'test', inputSchema: { type: 'object', properties: {} } }
@@ -47,6 +50,14 @@ const fakeOverlay = {
 const s2 = createServer(fakeOverlay);
 if (s2 && typeof s2.connect === 'function') ok('createServer({extraTools,extraHandler}) returns Server');
 else bad('createServer with overlay', s2);
+
+try {
+  await handleToolCall('overlayDemo', {});
+  bad('overlay tool is denied by dispatch', 'did not reject');
+} catch (e) {
+  if (/not approved for production use/.test(e.message)) ok('overlay tool is denied by dispatch');
+  else bad('overlay tool is denied by dispatch', e.message);
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
