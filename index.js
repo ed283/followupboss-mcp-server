@@ -3355,13 +3355,22 @@ export async function startHttp(opts = {}) {
   const PORT = parseInt(process.env.PORT || '3000', 10);
   const BEARER = process.env.MCP_BEARER_TOKEN;
   const AUTH_PASSWORD = process.env.MCP_AUTH_PASSWORD;
-  const AUTH_DISABLED = process.env.MCP_AUTH_DISABLED === 'true' || (!BEARER && !AUTH_PASSWORD);
+  // HTTP is fail-closed. The only unauthenticated mode is an explicit local
+  // development override; it cannot be enabled when NODE_ENV is production.
+  const AUTH_DISABLED_REQUESTED = process.env.MCP_AUTH_DISABLED === 'true';
+  const AUTH_DISABLED = AUTH_DISABLED_REQUESTED && process.env.NODE_ENV === 'development';
+  if (AUTH_DISABLED_REQUESTED && !AUTH_DISABLED) {
+    throw new Error('MCP_AUTH_DISABLED=true is permitted only with NODE_ENV=development. Configure MCP_BEARER_TOKEN or MCP_AUTH_PASSWORD for HTTP mode.');
+  }
+  if (!AUTH_DISABLED && !BEARER && !AUTH_PASSWORD) {
+    throw new Error('HTTP transport requires MCP_BEARER_TOKEN or MCP_AUTH_PASSWORD. Refusing to start an unauthenticated MCP endpoint.');
+  }
   const OAUTH_ENABLED = !!AUTH_PASSWORD && !AUTH_DISABLED;
   const ACCESS_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
   const AUTH_CODE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
   if (AUTH_DISABLED) {
-    console.error('WARNING: HTTP transport running without auth. Anyone who knows the URL can call the MCP.');
+    console.error('WARNING: HTTP transport authentication is disabled for local development. Do not expose this server publicly.');
   } else if (OAUTH_ENABLED) {
     console.error('HTTP transport running with OAuth 2.1 (DCR + PKCE + password gate).');
   } else {
