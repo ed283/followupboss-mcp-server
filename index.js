@@ -3394,6 +3394,63 @@ export async function startHttp(opts = {}) {
     console.error(`[oauth] ${event}`);
   }
 
+  // DCR metadata is useful for diagnosing public-client interoperability, but
+  // a registration payload is untrusted and may contain secrets in fields we
+  // do not support. Log only this narrow allowlist. Strip URL query strings
+  // and fragments so a redirect URI cannot leak embedded values.
+  function safeRedirectUris(value) {
+    if (!Array.isArray(value)) return value;
+    return value.map(uri => safeUri(uri));
+  }
+
+  function safeUri(uri) {
+    if (typeof uri !== 'string') return uri;
+    try {
+      const url = new URL(uri);
+      url.search = '';
+      url.hash = '';
+      return url.toString();
+    } catch {
+      return '[invalid URI]';
+    }
+  }
+
+  function logDcrMetadata(direction, metadata) {
+    console.error(`[oauth] dcr.${direction} ${JSON.stringify(metadata)}`);
+  }
+
+  function incomingDcrMetadata(body) {
+    const fields = ['grant_types', 'response_types', 'token_endpoint_auth_method', 'client_name',
+      'scope', 'application_type', 'contacts'];
+    const metadata = {};
+    if (body?.redirect_uris !== undefined) metadata.redirect_uris = safeRedirectUris(body.redirect_uris);
+    for (const field of fields) {
+      if (body?.[field] !== undefined) metadata[field] = body[field];
+    }
+    for (const field of ['client_uri', 'policy_uri', 'tos_uri']) {
+      if (body?.[field] !== undefined) metadata[field] = safeUri(body[field]);
+    }
+    return metadata;
+  }
+
+  function clientIdFingerprint(clientId) {
+    return createHash('sha256').update(clientId).digest('hex').slice(0, 12);
+  }
+
+  function parseDcrGrantTypes(value) {
+    const defaults = ['authorization_code', 'refresh_token'];
+    if (value === undefined) return defaults;
+    if (!Array.isArray(value) || value.length === 0 || !value.every(type => type === 'authorization_code' || type === 'refresh_token')) return null;
+    const grantTypes = [...new Set(value)];
+    return grantTypes.includes('authorization_code') ? grantTypes : null;
+  }
+
+  function parseDcrResponseTypes(value) {
+    if (value === undefined) return ['code'];
+    if (!Array.isArray(value) || value.length !== 1 || value[0] !== 'code') return null;
+    return ['code'];
+  }
+
   // RFC 8707 resource indicators bind tokens to this MCP endpoint. Do not
   // derive this from an untrusted resource parameter: the protected resource
   // is always this server's canonical /mcp URL.
@@ -3554,6 +3611,7 @@ export async function startHttp(opts = {}) {
   app.post('/oauth/register', (req, res) => {
     if (!OAUTH_ENABLED) return res.status(404).json({ error: 'oauth_disabled' });
     logAuthEvent('dcr.request');
+    logDcrMetadata('request.metadata', incomingDcrMetadata(req.body));
     // Parameter names only: redirect URIs and client metadata are not logged.
     logAuthEvent('dcr.params.redirect_uris');
     if (req.body?.grant_types !== undefined) logAuthEvent('dcr.params.grant_types');
@@ -3562,25 +3620,42 @@ export async function startHttp(opts = {}) {
     if (!redirect_uris.length) {
       return res.status(400).json({ error: 'invalid_redirect_uri', error_description: 'redirect_uris is required' });
     }
+    const grant_types = parseDcrGrantTypes(req.body?.grant_types);
+    const response_types = parseDcrResponseTypes(req.body?.response_types);
+    if (req.body?.token_endpoint_auth_method !== undefined && req.body.token_endpoint_auth_method !== 'none') {
+      return res.status(400).json({ error: 'invalid_client_metadata' });
+    }
+    if (!grant_types || !response_types) return res.status(400).json({ error: 'invalid_client_metadata' });
     const scope = parseScope(req.body?.scope);
     if (!scope) return res.status(400).json({ error: 'invalid_scope' });
     const client_id = randomBytes(16).toString('hex');
     const now = Math.floor(Date.now() / 1000);
-    clients.set(client_id, { redirect_uris, created_at: now, scope });
+    clients.set(client_id, { redirect_uris, grant_types, response_types, created_at: now, scope });
     if (!saveOAuthStore()) {
       clients.delete(client_id);
       return res.status(500).json({ error: 'server_error' });
     }
-    logAuthEvent('dcr.success');
-    res.status(201).json({
+    const registrationResponse = {
       client_id,
       client_id_issued_at: now,
       redirect_uris,
-      grant_types: ['authorization_code', 'refresh_token'],
-      response_types: ['code'],
+      grant_types,
+      response_types,
       token_endpoint_auth_method: 'none',
       scope
+    };
+    logDcrMetadata('response.metadata', {
+      client_id_fingerprint: clientIdFingerprint(client_id),
+      client_id_issued_at: registrationResponse.client_id_issued_at,
+      redirect_uris: safeRedirectUris(registrationResponse.redirect_uris),
+      grant_types: registrationResponse.grant_types,
+      response_types: registrationResponse.response_types,
+      token_endpoint_auth_method: registrationResponse.token_endpoint_auth_method,
+      scope: registrationResponse.scope
     });
+    logAuthEvent('dcr.success');
+    // RFC 7591 registration responses must not be stored by intermediaries.
+    res.set('Cache-Control', 'no-store').set('Pragma', 'no-cache').status(201).json(registrationResponse);
   });
 
   // OAuth: Authorization endpoint. GET renders a password form. POST checks
@@ -3697,7 +3772,9 @@ export async function startHttp(opts = {}) {
       }
 
       authCodes.delete(code);
-      const tokens = issueTokens(client_id, entry.scope, entry.resource, entry.scope.includes('offline_access'));
+      const client = clients.get(client_id);
+      const canRefresh = client?.grant_types?.includes('refresh_token') ?? true;
+      const tokens = issueTokens(client_id, entry.scope, entry.resource, entry.scope.includes('offline_access') && canRefresh);
       if (!saveOAuthStore()) {
         accessTokens.delete(tokens.access_token);
         if (tokens.refresh_token) refreshTokens.delete(tokens.refresh_token);

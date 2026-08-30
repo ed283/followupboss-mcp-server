@@ -138,6 +138,27 @@ async function listTools(base, accessToken, sessionId) {
   assert.ok(!names.includes('deletePerson'));
 }
 
+function assertStrictPublicClientRegistration(response, redirectUris) {
+  const permittedFields = new Set([
+    'client_id', 'client_id_issued_at', 'redirect_uris', 'grant_types',
+    'response_types', 'token_endpoint_auth_method', 'scope'
+  ]);
+  for (const field of Object.keys(response)) {
+    assert.ok(permittedFields.has(field), `unexpected DCR response field: ${field}`);
+    assert.notStrictEqual(response[field], null, `DCR response field must not be null: ${field}`);
+  }
+  assert.strictEqual(typeof response.client_id, 'string');
+  assert.ok(response.client_id.length > 0);
+  assert.strictEqual(typeof response.client_id_issued_at, 'number');
+  assert.deepStrictEqual(response.redirect_uris, redirectUris);
+  assert.deepStrictEqual(response.grant_types, ['authorization_code', 'refresh_token']);
+  assert.deepStrictEqual(response.response_types, ['code']);
+  assert.strictEqual(response.token_endpoint_auth_method, 'none');
+  assert.strictEqual(response.scope, 'mcp offline_access');
+  assert.ok(!Object.hasOwn(response, 'client_secret'));
+  assert.ok(!Object.hasOwn(response, 'client_secret_expires_at'));
+}
+
 // HTTP mode must not start with no authentication configuration.
 {
   const port = await getOpenPort();
@@ -215,13 +236,14 @@ async function listTools(base, accessToken, sessionId) {
   const password = 'oauth_test_password';
   const verifier = randomBytes(32).toString('base64url');
   const challenge = createHash('sha256').update(verifier).digest('base64url');
-  const callback = 'https://chatgpt.example.test/oauth/callback';
+  const callback = 'https://chatgpt.com/connector_platform_oauth_redirect';
   let firstServer;
   let secondServer;
   let thirdServer;
   let firstServerStopped = false;
   let secondServerStopped = false;
   let authorizationCode;
+  let dcrClientId;
   let originalTokens;
   let refreshedTokens;
   let output = '';
@@ -269,14 +291,41 @@ async function listTools(base, accessToken, sessionId) {
         grant_types: ['authorization_code', 'refresh_token'],
         response_types: ['code'],
         token_endpoint_auth_method: 'none',
+        client_name: 'ChatGPT Business MCP',
+        application_type: 'web',
+        contacts: ['mcp-admin@example.test'],
+        client_uri: 'https://chatgpt.com/connectors?diagnostic=ignored',
+        policy_uri: 'https://chatgpt.com/privacy#diagnostic',
+        tos_uri: 'https://chatgpt.com/terms',
         scope: 'mcp offline_access'
       })
     });
     assert.strictEqual(registration.status, 201, 'DCR registration must succeed');
+    assert.match(registration.headers.get('content-type'), /^application\/json(?:;|$)/,
+      'DCR response must be JSON');
+    assert.strictEqual(registration.headers.get('cache-control'), 'no-store',
+      'DCR response must not be cached');
+    assert.strictEqual(registration.headers.get('pragma'), 'no-cache',
+      'DCR response must include the RFC 7591 no-cache pragma');
     const registered = await registration.json();
-    assert.ok(registered.grant_types.includes('refresh_token'));
-    assert.strictEqual(registered.scope, 'mcp offline_access');
-    assert.deepStrictEqual(registered.redirect_uris, [callback], 'DCR must preserve the exact redirect URI');
+    assertStrictPublicClientRegistration(registered, [callback]);
+    dcrClientId = registered.client_id;
+
+    const codeOnlyRegistration = await fetch(`${firstBase}/oauth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        redirect_uris: [callback],
+        grant_types: ['authorization_code'],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'none',
+        scope: 'mcp'
+      })
+    });
+    assert.strictEqual(codeOnlyRegistration.status, 201);
+    const codeOnlyClient = await codeOnlyRegistration.json();
+    assert.deepStrictEqual(codeOnlyClient.grant_types, ['authorization_code'],
+      'DCR response must not add refresh_token when the public client did not register it');
 
     const authorizeParams = new URLSearchParams({
       client_id: registered.client_id,
@@ -421,6 +470,12 @@ async function listTools(base, accessToken, sessionId) {
     originalTokens?.refresh_token, refreshedTokens?.access_token, refreshedTokens?.refresh_token].filter(Boolean)) {
     assert.ok(!output.includes(secret), 'OAuth logs must not contain a test secret');
   }
+  assert.match(output, /\[oauth\] dcr\.request\.metadata \{.*"redirect_uris":\["https:\/\/chatgpt\.com\/connector_platform_oauth_redirect"\]/,
+    'sanitized DCR request log must retain the redirect URI structure');
+  assert.match(output, /\[oauth\] dcr\.response\.metadata \{.*"client_id_fingerprint":"[a-f0-9]{12}"/,
+    'sanitized DCR response log must fingerprint, not expose, client_id');
+  assert.ok(!output.includes(dcrClientId), 'DCR logs must not contain the raw client_id');
+  assert.ok(!output.includes('diagnostic=ignored'), 'DCR logs must strip redirect and client URI query values');
   for (const event of ['metadata.authorization_server.get', 'metadata.protected_resource.get',
     'mcp.unauthenticated.request', 'mcp.unauthenticated.response.401.www_authenticate',
     'dcr.request', 'dcr.params.redirect_uris', 'dcr.params.grant_types', 'dcr.params.response_types',
