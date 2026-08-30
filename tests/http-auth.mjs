@@ -138,7 +138,7 @@ async function listTools(base, accessToken, sessionId) {
   assert.ok(!names.includes('deletePerson'));
 }
 
-function assertStrictPublicClientRegistration(response, redirectUris) {
+function assertStrictPublicClientRegistration(response, redirectUris, expectedScope) {
   const permittedFields = new Set([
     'client_id', 'client_id_issued_at', 'redirect_uris', 'grant_types',
     'response_types', 'token_endpoint_auth_method', 'scope'
@@ -154,7 +154,11 @@ function assertStrictPublicClientRegistration(response, redirectUris) {
   assert.deepStrictEqual(response.grant_types, ['authorization_code', 'refresh_token']);
   assert.deepStrictEqual(response.response_types, ['code']);
   assert.strictEqual(response.token_endpoint_auth_method, 'none');
-  assert.strictEqual(response.scope, 'mcp offline_access');
+  if (expectedScope === undefined) {
+    assert.ok(!Object.hasOwn(response, 'scope'));
+  } else {
+    assert.strictEqual(response.scope, expectedScope);
+  }
   assert.ok(!Object.hasOwn(response, 'client_secret'));
   assert.ok(!Object.hasOwn(response, 'client_secret_expires_at'));
 }
@@ -236,7 +240,9 @@ function assertStrictPublicClientRegistration(response, redirectUris) {
   const password = 'oauth_test_password';
   const verifier = randomBytes(32).toString('base64url');
   const challenge = createHash('sha256').update(verifier).digest('base64url');
-  const callback = 'https://chatgpt.com/connector_platform_oauth_redirect';
+  const callbackId = randomBytes(9).toString('base64url');
+  assert.match(callbackId, /^[A-Za-z0-9_-]+$/, 'ChatGPT callback ID must be URL-safe');
+  const callback = `https://chatgpt.com/connector/oauth/${callbackId}`;
   let firstServer;
   let secondServer;
   let thirdServer;
@@ -291,13 +297,7 @@ function assertStrictPublicClientRegistration(response, redirectUris) {
         grant_types: ['authorization_code', 'refresh_token'],
         response_types: ['code'],
         token_endpoint_auth_method: 'none',
-        client_name: 'ChatGPT Business MCP',
-        application_type: 'web',
-        contacts: ['mcp-admin@example.test'],
-        client_uri: 'https://chatgpt.com/connectors?diagnostic=ignored',
-        policy_uri: 'https://chatgpt.com/privacy#diagnostic',
-        tos_uri: 'https://chatgpt.com/terms',
-        scope: 'mcp offline_access'
+        client_name: 'ChatGPT'
       })
     });
     assert.strictEqual(registration.status, 201, 'DCR registration must succeed');
@@ -470,12 +470,14 @@ function assertStrictPublicClientRegistration(response, redirectUris) {
     originalTokens?.refresh_token, refreshedTokens?.access_token, refreshedTokens?.refresh_token].filter(Boolean)) {
     assert.ok(!output.includes(secret), 'OAuth logs must not contain a test secret');
   }
-  assert.match(output, /\[oauth\] dcr\.request\.metadata \{.*"redirect_uris":\["https:\/\/chatgpt\.com\/connector_platform_oauth_redirect"\]/,
-    'sanitized DCR request log must retain the redirect URI structure');
+  assert.ok(output.includes(`"redirect_uris":["${callback}"]`),
+    'sanitized DCR request log must retain the dynamic ChatGPT redirect URI structure');
   assert.match(output, /\[oauth\] dcr\.response\.metadata \{.*"client_id_fingerprint":"[a-f0-9]{12}"/,
     'sanitized DCR response log must fingerprint, not expose, client_id');
+  const firstDcrResponseLog = output.match(/^\[oauth\] dcr\.response\.metadata .*$/m)?.[0];
+  assert.ok(firstDcrResponseLog, 'DCR response metadata must be logged');
+  assert.ok(!firstDcrResponseLog.includes('"scope"'), 'scope must be absent when ChatGPT did not register one');
   assert.ok(!output.includes(dcrClientId), 'DCR logs must not contain the raw client_id');
-  assert.ok(!output.includes('diagnostic=ignored'), 'DCR logs must strip redirect and client URI query values');
   for (const event of ['metadata.authorization_server.get', 'metadata.protected_resource.get',
     'mcp.unauthenticated.request', 'mcp.unauthenticated.response.401.www_authenticate',
     'dcr.request', 'dcr.params.redirect_uris', 'dcr.params.grant_types', 'dcr.params.response_types',

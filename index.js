@@ -3626,6 +3626,7 @@ export async function startHttp(opts = {}) {
       return res.status(400).json({ error: 'invalid_client_metadata' });
     }
     if (!grant_types || !response_types) return res.status(400).json({ error: 'invalid_client_metadata' });
+    const scopeWasRegistered = req.body?.scope !== undefined;
     const scope = parseScope(req.body?.scope);
     if (!scope) return res.status(400).json({ error: 'invalid_scope' });
     const client_id = randomBytes(16).toString('hex');
@@ -3642,7 +3643,7 @@ export async function startHttp(opts = {}) {
       grant_types,
       response_types,
       token_endpoint_auth_method: 'none',
-      scope
+      ...(scopeWasRegistered ? { scope } : {})
     };
     logDcrMetadata('response.metadata', {
       client_id_fingerprint: clientIdFingerprint(client_id),
@@ -3651,7 +3652,7 @@ export async function startHttp(opts = {}) {
       grant_types: registrationResponse.grant_types,
       response_types: registrationResponse.response_types,
       token_endpoint_auth_method: registrationResponse.token_endpoint_auth_method,
-      scope: registrationResponse.scope
+      ...(scopeWasRegistered ? { scope: registrationResponse.scope } : {})
     });
     logAuthEvent('dcr.success');
     // RFC 7591 registration responses must not be stored by intermediaries.
