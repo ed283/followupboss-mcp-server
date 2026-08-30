@@ -98,6 +98,12 @@ const initRequest = {
   }
 };
 
+function parseSseJsonRpc(body) {
+  const data = body.match(/^data: (.+)$/m)?.[1];
+  assert.ok(data, 'MCP SSE response must contain a JSON-RPC data event');
+  return JSON.parse(data);
+}
+
 async function initializeMcp(base, accessToken) {
   const response = await fetch(`${base}/mcp`, {
     method: 'POST',
@@ -110,10 +116,17 @@ async function initializeMcp(base, accessToken) {
   });
   const body = await response.text();
   assert.strictEqual(response.status, 200, 'OAuth access token must initialize MCP');
-  assert.match(body, /serverInfo/);
+  assert.match(response.headers.get('content-type'), /^text\/event-stream(?:;|$)/,
+    'default Streamable HTTP initialize response must be SSE');
+  const message = parseSseJsonRpc(body);
+  assert.strictEqual(message.jsonrpc, '2.0');
+  assert.strictEqual(message.id, initRequest.id);
+  assert.strictEqual(message.result.protocolVersion, initRequest.params.protocolVersion);
+  assert.deepStrictEqual(message.result.capabilities, { tools: {} });
+  assert.ok(message.result.serverInfo?.name);
   const sessionId = response.headers.get('mcp-session-id');
   assert.ok(sessionId, 'MCP initialize must return a session ID');
-  return { sessionId, body };
+  return { sessionId, body, message };
 }
 
 async function listTools(base, accessToken, sessionId) {
@@ -123,12 +136,14 @@ async function listTools(base, accessToken, sessionId) {
       'Content-Type': 'application/json',
       'Accept': 'application/json, text/event-stream',
       Authorization: `Bearer ${accessToken}`,
-      'Mcp-Session-Id': sessionId
+      'Mcp-Session-Id': sessionId,
+      'MCP-Protocol-Version': initRequest.params.protocolVersion
     },
     body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })
   });
   const body = await response.text();
   assert.strictEqual(response.status, 200, 'OAuth access token must reach tools/list');
+  assert.match(response.headers.get('content-type'), /^text\/event-stream(?:;|$)/);
   const normalized = body.replace(/\\"/g, '"');
   const names = [...normalized.matchAll(/"name":"([^"]+)"/g)].map(match => match[1]);
   assert.strictEqual(names.length, 60, 'OAuth tools/list must return exactly 60 tools');
@@ -136,6 +151,22 @@ async function listTools(base, accessToken, sessionId) {
   assert.ok(names.includes('createTask'));
   assert.ok(!names.includes('createPerson'));
   assert.ok(!names.includes('deletePerson'));
+}
+
+async function sendInitializedNotification(base, accessToken, sessionId) {
+  const response = await fetch(`${base}/mcp`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/event-stream',
+      Authorization: `Bearer ${accessToken}`,
+      'Mcp-Session-Id': sessionId,
+      'MCP-Protocol-Version': initRequest.params.protocolVersion
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })
+  });
+  assert.strictEqual(response.status, 202, 'notifications/initialized must be accepted');
+  assert.strictEqual(await response.text(), '', 'notifications/initialized must not return a JSON-RPC body');
 }
 
 function assertStrictPublicClientRegistration(response, redirectUris, expectedScope) {
@@ -250,6 +281,7 @@ function assertStrictPublicClientRegistration(response, redirectUris, expectedSc
   let secondServerStopped = false;
   let authorizationCode;
   let dcrClientId;
+  let mcpSessionId;
   let originalTokens;
   let refreshedTokens;
   let output = '';
@@ -374,6 +406,52 @@ function assertStrictPublicClientRegistration(response, redirectUris, expectedSc
     assert.strictEqual(originalTokens.scope, 'mcp offline_access');
 
     const firstSession = await initializeMcp(firstBase, originalTokens.access_token);
+    mcpSessionId = firstSession.sessionId;
+    const activeHealth = await (await fetch(`${firstBase}/health`)).json();
+    assert.strictEqual(activeHealth.sessions, 1, 'initialize must persist one Streamable HTTP session');
+    await sendInitializedNotification(firstBase, originalTokens.access_token, firstSession.sessionId);
+
+    const missingProtocolVersion = await fetch(`${firstBase}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        Authorization: `Bearer ${originalTokens.access_token}`,
+        'Mcp-Session-Id': firstSession.sessionId
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 99, method: 'tools/list' })
+    });
+    assert.strictEqual(missingProtocolVersion.status, 200,
+      'SDK accepts a missing later MCP-Protocol-Version header using the negotiated version');
+    await missingProtocolVersion.text();
+
+    const unsupportedProtocolVersion = await fetch(`${firstBase}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        Authorization: `Bearer ${originalTokens.access_token}`,
+        'Mcp-Session-Id': firstSession.sessionId,
+        'MCP-Protocol-Version': 'not-a-protocol-version'
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 100, method: 'tools/list' })
+    });
+    assert.strictEqual(unsupportedProtocolVersion.status, 400,
+      'unsupported later MCP-Protocol-Version header must be rejected');
+
+    const invalidSession = await fetch(`${firstBase}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        Authorization: `Bearer ${originalTokens.access_token}`,
+        'Mcp-Session-Id': 'not-a-real-session',
+        'MCP-Protocol-Version': initRequest.params.protocolVersion
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 101, method: 'tools/list' })
+    });
+    assert.strictEqual(invalidSession.status, 404, 'unknown session ID must be rejected as not found');
+    assert.strictEqual((await invalidSession.json()).error.code, -32001);
     await listTools(firstBase, originalTokens.access_token, firstSession.sessionId);
 
     const refreshResponse = await fetch(`${firstBase}/oauth/token`, {
@@ -466,7 +544,7 @@ function assertStrictPublicClientRegistration(response, redirectUris, expectedSc
     output += thirdServer?.output() || '';
     await rm(storeDirectory, { recursive: true, force: true });
   }
-  for (const secret of [password, verifier, challenge, authorizationCode, originalTokens?.access_token,
+  for (const secret of [password, verifier, challenge, authorizationCode, mcpSessionId, originalTokens?.access_token,
     originalTokens?.refresh_token, refreshedTokens?.access_token, refreshedTokens?.refresh_token].filter(Boolean)) {
     assert.ok(!output.includes(secret), 'OAuth logs must not contain a test secret');
   }
@@ -484,6 +562,10 @@ function assertStrictPublicClientRegistration(response, redirectUris, expectedSc
     'authorize.get', 'authorize.params.client_id,redirect_uri,response_type,code_challenge,code_challenge_method,scope,resource', 'authorize.post.success',
     'token.authorization_code.request', 'token.refresh.request', 'mcp.initialize', 'mcp.tools.list']) {
     assert.ok(output.includes(`[oauth] ${event}`), `sanitized log must include ${event}`);
+  }
+  for (const event of ['request.received', 'response.sent', 'initialize.received',
+    'initialized_notification.received', 'tools_list.received']) {
+    assert.ok(output.includes(`[mcp-http] ${event}`), `handshake diagnostic must include ${event}`);
   }
 }
 

@@ -21,7 +21,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { CallToolRequestSchema, ListToolsRequestSchema, LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from '@modelcontextprotocol/sdk/types.js';
 import axios from 'axios';
 import express from 'express';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'fs';
@@ -3394,6 +3394,29 @@ export async function startHttp(opts = {}) {
     console.error(`[oauth] ${event}`);
   }
 
+  // Streamable HTTP handshake diagnostics. Values are intentionally limited to
+  // protocol metadata and booleans; never log headers, bodies, tokens, or raw
+  // session IDs.
+  function logMcpHttpEvent(event, fields = {}) {
+    console.error(`[mcp-http] ${event} ${JSON.stringify(fields)}`);
+  }
+
+  function sessionFingerprint(sessionId) {
+    return sessionId ? createHash('sha256').update(String(sessionId)).digest('hex').slice(0, 12) : undefined;
+  }
+
+  function observeRejectedMcpResponse(req, res) {
+    res.once('finish', () => {
+      logMcpHttpEvent('response.sent', {
+        rpc_method: req.body?.method ?? null,
+        status: res.statusCode,
+        content_type: res.getHeader('content-type') || null,
+        session_fingerprint: undefined,
+        sessions: undefined
+      });
+    });
+  }
+
   // DCR metadata is useful for diagnosing public-client interoperability, but
   // a registration payload is untrusted and may contain secrets in fields we
   // do not support. Log only this narrow allowlist. Strip URL query strings
@@ -3814,9 +3837,14 @@ export async function startHttp(opts = {}) {
   };
 
   const requireAuth = (req, res, next) => {
-    if (AUTH_DISABLED) return next();
+    if (AUTH_DISABLED) {
+      req.mcpAuthAccepted = true;
+      return next();
+    }
     const header = req.headers['authorization'] || '';
     if (!header.startsWith('Bearer ')) {
+      logMcpHttpEvent('request.rejected', { http_method: req.method, rpc_method: req.body?.method ?? null, auth_accepted: false });
+      observeRejectedMcpResponse(req, res);
       logAuthEvent('mcp.unauthenticated.request');
       res.set('WWW-Authenticate', wwwAuthenticateHeader(req));
       logAuthEvent('mcp.unauthenticated.response.401.www_authenticate');
@@ -3826,17 +3854,23 @@ export async function startHttp(opts = {}) {
     if (OAUTH_ENABLED) {
       const entry = accessTokens.get(token);
       if (!entry || entry.expires_at < Date.now()) {
+        logMcpHttpEvent('request.rejected', { http_method: req.method, rpc_method: req.body?.method ?? null, auth_accepted: false });
+        observeRejectedMcpResponse(req, res);
         logAuthEvent('mcp.unauthenticated.request');
         res.set('WWW-Authenticate', wwwAuthenticateHeader(req));
         logAuthEvent('mcp.unauthenticated.response.401.www_authenticate');
         return res.status(401).json({ error: 'unauthorized' });
       }
+      req.mcpAuthAccepted = true;
       return next();
     }
     // Static bearer fallback (single-tenant deployments).
     if (!constantTimeEq(token, BEARER)) {
+      logMcpHttpEvent('request.rejected', { http_method: req.method, rpc_method: req.body?.method ?? null, auth_accepted: false });
+      observeRejectedMcpResponse(req, res);
       return res.status(401).json({ error: 'unauthorized' });
     }
+    req.mcpAuthAccepted = true;
     next();
   };
 
@@ -3865,9 +3899,37 @@ export async function startHttp(opts = {}) {
   }, SWEEP_MS);
   sweeper.unref();
 
+  function observeMcpResponse(req, res, details, getSessionId = () => undefined) {
+    logMcpHttpEvent('request.received', details);
+    res.once('finish', () => {
+      const sessionId = getSessionId();
+      logMcpHttpEvent('response.sent', {
+        rpc_method: details.rpc_method,
+        status: res.statusCode,
+        content_type: res.getHeader('content-type') || null,
+        session_fingerprint: sessionFingerprint(sessionId),
+        sessions: transports.size
+      });
+    });
+  }
+
   app.post('/mcp', requireAuth, async (req, res) => {
     const sessionId = req.headers['mcp-session-id'];
     let transport = sessionId ? transports.get(sessionId) : undefined;
+    const rpcMethod = req.body?.method ?? null;
+    const details = {
+      http_method: req.method,
+      rpc_method: rpcMethod,
+      has_id: req.body?.id !== undefined,
+      has_session_id: Boolean(sessionId),
+      has_protocol_version: req.headers['mcp-protocol-version'] !== undefined,
+      auth_accepted: req.mcpAuthAccepted === true,
+      session_lookup: sessionId ? (transport ? 'found' : 'missing') : 'not_provided'
+    };
+    observeMcpResponse(req, res, details, () => transport?.sessionId);
+    if (sessionId && !transport) {
+      return res.status(404).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: req.body?.id ?? null });
+    }
     if (!transport) {
       const mcpServer = createServer(opts);
       transport = new StreamableHTTPServerTransport({
@@ -3880,8 +3942,25 @@ export async function startHttp(opts = {}) {
       await mcpServer.connect(transport);
     }
     transport.lastSeen = Date.now();
-    if (req.body?.method === 'initialize') logAuthEvent('mcp.initialize');
-    if (req.body?.method === 'tools/list') logAuthEvent('mcp.tools.list');
+    if (rpcMethod === 'initialize') {
+      const requestedProtocolVersion = req.body?.params?.protocolVersion ?? null;
+      const returnedProtocolVersion = SUPPORTED_PROTOCOL_VERSIONS.includes(requestedProtocolVersion)
+        ? requestedProtocolVersion : LATEST_PROTOCOL_VERSION;
+      logAuthEvent('mcp.initialize');
+      logMcpHttpEvent('initialize.received', {
+        requested_protocol_version: requestedProtocolVersion,
+        returned_protocol_version: returnedProtocolVersion,
+        capability_keys: ['tools'],
+        tools_capability_present: true
+      });
+    }
+    if (rpcMethod === 'notifications/initialized') {
+      logMcpHttpEvent('initialized_notification.received', { session_lookup: details.session_lookup });
+    }
+    if (rpcMethod === 'tools/list') {
+      logAuthEvent('mcp.tools.list');
+      logMcpHttpEvent('tools_list.received', { session_lookup: details.session_lookup, tool_count: activeTools.length });
+    }
     try {
       await transport.handleRequest(req, res, req.body);
     } catch {
