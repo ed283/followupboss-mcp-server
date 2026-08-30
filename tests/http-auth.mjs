@@ -12,6 +12,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { createHash, randomBytes } from 'crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { JSONRPCMessageSchema } from '@modelcontextprotocol/sdk/types.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, '..');
@@ -124,6 +125,22 @@ const initRequest = {
     clientInfo: { name: 'http-auth-test', version: '1.0.0' }
   }
 };
+
+function chatGptInitializeRequest() {
+  return {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: {
+      protocolVersion: '2025-11-25',
+      clientInfo: { name: 'openai-mcp (ChatGPT)', version: '1.0.0' },
+      capabilities: {
+        experimental: { 'openai/visibility': { enabled: true } },
+        extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: [] } }
+      }
+    }
+  };
+}
 
 function parseSseJsonRpc(body) {
   const data = body.match(/^data: (.+)$/m)?.[1];
@@ -250,6 +267,9 @@ function assertStrictPublicClientRegistration(response, redirectUris, expectedSc
 // and handleRequest(req, res, req.body) separately.
 {
   const direct = await launchDirectTransport();
+  const chatGptInitialize = chatGptInitializeRequest();
+  assert.ok(JSONRPCMessageSchema.safeParse(chatGptInitialize).success,
+    'the exact ChatGPT initialize body must pass the SDK JSON-RPC schema');
   try {
     const response = await fetch(`${direct.base}/mcp`, {
       method: 'POST',
@@ -257,7 +277,7 @@ function assertStrictPublicClientRegistration(response, redirectUris, expectedSc
         'Content-Type': 'application/json',
         'Accept': 'application/json, text/event-stream'
       },
-      body: JSON.stringify(initRequest)
+      body: JSON.stringify(chatGptInitialize)
     });
     assert.strictEqual(response.status, 200, 'direct SDK initialize must not return a parse error');
     const message = parseSseJsonRpc(await response.text());
@@ -558,6 +578,8 @@ function assertStrictPublicClientRegistration(response, redirectUris, expectedSc
     // Each accepted initialize intentionally receives an independent session.
     await assertInitializeStatus(firstBase, originalTokens.access_token, structuredClone(initRequest), 200,
       'normal initialize object must succeed');
+    await assertInitializeStatus(firstBase, originalTokens.access_token, chatGptInitializeRequest(), 200,
+      'exact ChatGPT initialize capabilities must succeed through the Express route');
     const extraCapabilities = structuredClone(initRequest);
     extraCapabilities.params.capabilities = { experimental: { 'chatgpt/test': { enabled: true } } };
     await assertInitializeStatus(firstBase, originalTokens.access_token, extraCapabilities, 200,

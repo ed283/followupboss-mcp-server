@@ -3488,6 +3488,20 @@ export async function startHttp(opts = {}) {
     }
   }
 
+  function safeExceptionMessage(error) {
+    const message = String(error?.message ?? 'Unknown transport error');
+    // Keep only ordinary diagnostic punctuation; redact anything that could be
+    // serialized request content, a URL, or credential-bearing text.
+    return message.length <= 300 && /^[\w\s:.,()'\-]+$/.test(message) ? message : '[redacted]';
+  }
+
+  function safeStackLocations(error) {
+    return String(error?.stack ?? '').split('\n').slice(1, 5).map(line => {
+      const location = line.match(/([^/\\()\s]+\.(?:js|mjs|cjs):\d+:\d+)/)?.[1];
+      return location || '[location unavailable]';
+    });
+  }
+
   function observeRejectedMcpResponse(req, res) {
     res.once('finish', () => {
       logMcpHttpEvent('response.sent', {
@@ -4050,6 +4064,13 @@ export async function startHttp(opts = {}) {
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (id) => transports.set(id, transport)
       });
+      transport.onerror = (error) => {
+        logMcpHttpEvent('transport.exception', {
+          error_name: error?.name || 'Error',
+          error_message: safeExceptionMessage(error),
+          stack_locations: safeStackLocations(error)
+        });
+      };
       transport.onclose = () => {
         if (transport.sessionId) transports.delete(transport.sessionId);
       };
