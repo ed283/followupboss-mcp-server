@@ -3367,6 +3367,7 @@ export async function startHttp(opts = {}) {
   }
   const OAUTH_ENABLED = !!AUTH_PASSWORD && !AUTH_DISABLED;
   const ACCESS_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+  const REFRESH_TOKEN_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
   const AUTH_CODE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
   if (AUTH_DISABLED) {
@@ -3381,20 +3382,30 @@ export async function startHttp(opts = {}) {
   app.use(express.json({ limit: '4mb' }));
   app.use(express.urlencoded({ extended: false }));
 
-  // OAuth clients + access tokens persist to disk so a server restart
+  // OAuth clients, access tokens, and refresh tokens persist to disk so a server restart
   // (redeploy, crash, host reboot) does not force every connected client to
   // re-authenticate. authCodes stay in-memory -- 5-min TTL, losing one
   // mid-flight just means retry the login, not worth the disk writes.
   const OAUTH_STORE_PATH = process.env.MCP_OAUTH_STORE_PATH || resolve(__dirname, 'data/oauth-store.json');
 
+  // Never include request bodies, URLs, headers, or identifiers here: they can
+  // contain passwords, codes, or tokens. Event names are intentionally static.
+  function logAuthEvent(event) {
+    console.error(`[oauth] ${event}`);
+  }
+
   function loadOAuthStore() {
     try {
-      if (!existsSync(OAUTH_STORE_PATH)) return { clients: {}, accessTokens: {} };
+      if (!existsSync(OAUTH_STORE_PATH)) return { clients: {}, accessTokens: {}, refreshTokens: {} };
       const data = JSON.parse(readFileSync(OAUTH_STORE_PATH, 'utf8'));
-      return { clients: data.clients || {}, accessTokens: data.accessTokens || {} };
+      return {
+        clients: data.clients || {},
+        accessTokens: data.accessTokens || {},
+        refreshTokens: data.refreshTokens || {}
+      };
     } catch (e) {
       console.error(`OAuth store at ${OAUTH_STORE_PATH} unreadable, starting empty:`, e.message);
-      return { clients: {}, accessTokens: {} };
+      return { clients: {}, accessTokens: {}, refreshTokens: {} };
     }
   }
 
@@ -3404,11 +3415,14 @@ export async function startHttp(opts = {}) {
       const tmpPath = `${OAUTH_STORE_PATH}.tmp`;
       writeFileSync(tmpPath, JSON.stringify({
         clients: Object.fromEntries(clients),
-        accessTokens: Object.fromEntries(accessTokens)
+        accessTokens: Object.fromEntries(accessTokens),
+        refreshTokens: Object.fromEntries(refreshTokens)
       }));
       renameSync(tmpPath, OAUTH_STORE_PATH);
+      return true;
     } catch (e) {
       console.error(`OAuth store save to ${OAUTH_STORE_PATH} failed:`, e.message);
+      return false;
     }
   }
 
@@ -3416,6 +3430,37 @@ export async function startHttp(opts = {}) {
   const clients = new Map(Object.entries(oauthStore.clients));       // client_id -> { redirect_uris, created_at }
   const authCodes = new Map();     // code -> { client_id, redirect_uri, code_challenge, expires_at } (in-memory, short TTL)
   const accessTokens = new Map(Object.entries(oauthStore.accessTokens));  // token -> { client_id, expires_at }
+  const refreshTokens = new Map(Object.entries(oauthStore.refreshTokens)); // token -> { client_id, scope, expires_at }
+
+  function parseScope(scope) {
+    const requested = new Set(String(scope || 'mcp').trim().split(/\s+/).filter(Boolean));
+    if (requested.size === 0) requested.add('mcp');
+    if (![...requested].every(value => value === 'mcp' || value === 'offline_access')) return null;
+    requested.add('mcp');
+    return [...requested].sort().join(' ');
+  }
+
+  function issueTokens(clientId, scope, includeRefreshToken) {
+    const access_token = randomBytes(32).toString('hex');
+    const expires_at = Date.now() + ACCESS_TOKEN_TTL_MS;
+    accessTokens.set(access_token, { client_id: clientId, expires_at });
+    const response = {
+      access_token,
+      token_type: 'Bearer',
+      expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
+      scope
+    };
+    if (includeRefreshToken) {
+      const refresh_token = randomBytes(32).toString('hex');
+      refreshTokens.set(refresh_token, {
+        client_id: clientId,
+        scope,
+        expires_at: Date.now() + REFRESH_TOKEN_TTL_MS
+      });
+      response.refresh_token = refresh_token;
+    }
+    return response;
+  }
 
   // Periodic cleanup of expired state.
   setInterval(() => {
@@ -3423,6 +3468,7 @@ export async function startHttp(opts = {}) {
     let accessTokensChanged = false;
     for (const [k, v] of authCodes) if (v.expires_at < now) authCodes.delete(k);
     for (const [k, v] of accessTokens) if (v.expires_at < now) { accessTokens.delete(k); accessTokensChanged = true; }
+    for (const [k, v] of refreshTokens) if (v.expires_at < now) { refreshTokens.delete(k); accessTokensChanged = true; }
     if (accessTokensChanged) saveOAuthStore();
   }, 60 * 1000);
 
@@ -3467,10 +3513,10 @@ export async function startHttp(opts = {}) {
       token_endpoint: `${base}/oauth/token`,
       registration_endpoint: `${base}/oauth/register`,
       response_types_supported: ['code'],
-      grant_types_supported: ['authorization_code'],
+      grant_types_supported: ['authorization_code', 'refresh_token'],
       code_challenge_methods_supported: ['S256'],
       token_endpoint_auth_methods_supported: ['none'],
-      scopes_supported: ['mcp']
+      scopes_supported: ['mcp', 'offline_access']
     });
   });
 
@@ -3480,7 +3526,7 @@ export async function startHttp(opts = {}) {
     res.json({
       resource: `${base}/mcp`,
       authorization_servers: [base],
-      scopes_supported: ['mcp']
+      scopes_supported: ['mcp', 'offline_access']
     });
   });
 
@@ -3488,22 +3534,29 @@ export async function startHttp(opts = {}) {
   // dynamically; we hand back a client_id with no secret (public client).
   app.post('/oauth/register', (req, res) => {
     if (!OAUTH_ENABLED) return res.status(404).json({ error: 'oauth_disabled' });
+    logAuthEvent('dcr.request');
     const redirect_uris = Array.isArray(req.body?.redirect_uris) ? req.body.redirect_uris : [];
     if (!redirect_uris.length) {
       return res.status(400).json({ error: 'invalid_redirect_uri', error_description: 'redirect_uris is required' });
     }
+    const scope = parseScope(req.body?.scope);
+    if (!scope) return res.status(400).json({ error: 'invalid_scope' });
     const client_id = randomBytes(16).toString('hex');
     const now = Math.floor(Date.now() / 1000);
-    clients.set(client_id, { redirect_uris, created_at: now });
-    saveOAuthStore();
+    clients.set(client_id, { redirect_uris, created_at: now, scope });
+    if (!saveOAuthStore()) {
+      clients.delete(client_id);
+      return res.status(500).json({ error: 'server_error' });
+    }
+    logAuthEvent('dcr.success');
     res.status(201).json({
       client_id,
       client_id_issued_at: now,
       redirect_uris,
-      grant_types: ['authorization_code'],
+      grant_types: ['authorization_code', 'refresh_token'],
       response_types: ['code'],
       token_endpoint_auth_method: 'none',
-      scope: 'mcp'
+      scope
     });
   });
 
@@ -3511,13 +3564,16 @@ export async function startHttp(opts = {}) {
   // the password, mints an auth code, redirects back to the client.
   app.get('/oauth/authorize', (req, res) => {
     if (!OAUTH_ENABLED) return res.status(404).send('OAuth disabled');
+    logAuthEvent('authorize.get');
     const { client_id, redirect_uri, state, code_challenge, code_challenge_method, response_type } = req.query;
+    const scope = parseScope(req.query.scope);
     const client = clients.get(client_id);
     if (!client) return res.status(400).send('Invalid client_id');
     if (!client.redirect_uris.includes(redirect_uri)) return res.status(400).send('redirect_uri not registered');
     if (response_type !== 'code') return res.status(400).send('Only response_type=code supported');
     if (code_challenge_method !== 'S256') return res.status(400).send('Only S256 PKCE supported');
     if (!code_challenge) return res.status(400).send('code_challenge required');
+    if (!scope) return res.status(400).send('invalid_scope');
 
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(`<!DOCTYPE html>
@@ -3544,6 +3600,7 @@ export async function startHttp(opts = {}) {
     <input type="hidden" name="redirect_uri" value="${esc(redirect_uri)}">
     <input type="hidden" name="state" value="${esc(state || '')}">
     <input type="hidden" name="code_challenge" value="${esc(code_challenge)}">
+    <input type="hidden" name="scope" value="${esc(scope)}">
     <label for="pw">Password</label>
     <input id="pw" name="password" type="password" autocomplete="current-password" autofocus required>
     <button type="submit">Authorize</button>
@@ -3554,15 +3611,20 @@ export async function startHttp(opts = {}) {
 
   app.post('/oauth/authorize', (req, res) => {
     if (!OAUTH_ENABLED) return res.status(404).send('OAuth disabled');
+    logAuthEvent('authorize.post');
     const { client_id, redirect_uri, state, code_challenge, password } = req.body;
+    const scope = parseScope(req.body.scope);
     const client = clients.get(client_id);
-    if (!client) return res.status(400).send('Invalid client_id');
-    if (!client.redirect_uris.includes(redirect_uri)) return res.status(400).send('redirect_uri not registered');
+    if (!client || !client.redirect_uris.includes(redirect_uri) || !scope) {
+      logAuthEvent('authorize.post.failure');
+      return res.status(400).send(!scope ? 'invalid_scope' : 'Invalid client_id or redirect_uri');
+    }
 
     if (!password || !constantTimeEq(password, AUTH_PASSWORD)) {
+      logAuthEvent('authorize.post.failure');
       const q = new URLSearchParams({
-        client_id, redirect_uri, state: state || '', code_challenge,
-        code_challenge_method: 'S256', response_type: 'code',
+      client_id, redirect_uri, state: state || '', code_challenge,
+        code_challenge_method: 'S256', response_type: 'code', scope,
         err: 'Wrong password.'
       });
       return res.redirect(`/oauth/authorize?${q.toString()}`);
@@ -3571,47 +3633,68 @@ export async function startHttp(opts = {}) {
     const code = randomBytes(32).toString('hex');
     authCodes.set(code, {
       client_id, redirect_uri, code_challenge,
+      scope,
       expires_at: Date.now() + AUTH_CODE_TTL_MS
     });
+    logAuthEvent('authorize.post.success');
     const url = new URL(redirect_uri);
     url.searchParams.set('code', code);
     if (state) url.searchParams.set('state', state);
     res.redirect(url.toString());
   });
 
-  // OAuth: Token endpoint. Exchange authorization_code + PKCE verifier for an access token.
+  // OAuth: Token endpoint. Exchange authorization_code + PKCE or rotate a
+  // refresh token. Refresh tokens are one-time-use and persisted atomically.
   app.post('/oauth/token', (req, res) => {
     if (!OAUTH_ENABLED) return res.status(404).json({ error: 'oauth_disabled' });
-    const { grant_type, code, redirect_uri, client_id, code_verifier } = req.body;
-    if (grant_type !== 'authorization_code') return res.status(400).json({ error: 'unsupported_grant_type' });
-    const entry = authCodes.get(code);
-    if (!entry) return res.status(400).json({ error: 'invalid_grant', error_description: 'Unknown code' });
-    if (entry.expires_at < Date.now()) {
+    const { grant_type, code, redirect_uri, client_id, code_verifier, refresh_token } = req.body;
+    if (grant_type === 'authorization_code') {
+      logAuthEvent('token.authorization_code.request');
+      const entry = authCodes.get(code);
+      if (!entry) return res.status(400).json({ error: 'invalid_grant', error_description: 'Unknown code' });
+      if (entry.expires_at < Date.now()) {
+        authCodes.delete(code);
+        return res.status(400).json({ error: 'invalid_grant', error_description: 'Code expired' });
+      }
+      if (entry.client_id !== client_id) return res.status(400).json({ error: 'invalid_grant', error_description: 'client_id mismatch' });
+      if (entry.redirect_uri !== redirect_uri) return res.status(400).json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch' });
+      if (!code_verifier) return res.status(400).json({ error: 'invalid_request', error_description: 'code_verifier required' });
+
+      const expectedChallenge = createHash('sha256').update(code_verifier).digest('base64url');
+      if (expectedChallenge !== entry.code_challenge) {
+        return res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
+      }
+
       authCodes.delete(code);
-      return res.status(400).json({ error: 'invalid_grant', error_description: 'Code expired' });
+      const tokens = issueTokens(client_id, entry.scope, entry.scope.includes('offline_access'));
+      if (!saveOAuthStore()) {
+        accessTokens.delete(tokens.access_token);
+        if (tokens.refresh_token) refreshTokens.delete(tokens.refresh_token);
+        return res.status(500).json({ error: 'server_error' });
+      }
+      logAuthEvent('token.authorization_code.success');
+      return res.json(tokens);
     }
-    if (entry.client_id !== client_id) return res.status(400).json({ error: 'invalid_grant', error_description: 'client_id mismatch' });
-    if (entry.redirect_uri !== redirect_uri) return res.status(400).json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch' });
-    if (!code_verifier) return res.status(400).json({ error: 'invalid_request', error_description: 'code_verifier required' });
 
-    const expectedChallenge = createHash('sha256').update(code_verifier).digest('base64url');
-    if (expectedChallenge !== entry.code_challenge) {
-      return res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
+    if (grant_type === 'refresh_token') {
+      logAuthEvent('token.refresh.request');
+      const entry = refreshTokens.get(refresh_token);
+      if (!entry || entry.expires_at < Date.now() || (client_id && entry.client_id !== client_id)) {
+        if (entry?.expires_at < Date.now()) refreshTokens.delete(refresh_token);
+        return res.status(400).json({ error: 'invalid_grant' });
+      }
+      refreshTokens.delete(refresh_token);
+      const tokens = issueTokens(entry.client_id, entry.scope, true);
+      if (!saveOAuthStore()) {
+        accessTokens.delete(tokens.access_token);
+        refreshTokens.delete(tokens.refresh_token);
+        return res.status(500).json({ error: 'server_error' });
+      }
+      logAuthEvent('token.refresh.success');
+      return res.json(tokens);
     }
 
-    authCodes.delete(code);
-    const access_token = randomBytes(32).toString('hex');
-    accessTokens.set(access_token, {
-      client_id,
-      expires_at: Date.now() + ACCESS_TOKEN_TTL_MS
-    });
-    saveOAuthStore();
-    res.json({
-      access_token,
-      token_type: 'Bearer',
-      expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
-      scope: 'mcp'
-    });
+    return res.status(400).json({ error: 'unsupported_grant_type' });
   });
 
   // Auth middleware protecting /mcp.
@@ -3683,10 +3766,12 @@ export async function startHttp(opts = {}) {
       await mcpServer.connect(transport);
     }
     transport.lastSeen = Date.now();
+    if (req.body?.method === 'initialize') logAuthEvent('mcp.initialize');
+    if (req.body?.method === 'tools/list') logAuthEvent('mcp.tools.list');
     try {
       await transport.handleRequest(req, res, req.body);
-    } catch (e) {
-      console.error('MCP POST error', e);
+    } catch {
+      console.error('[oauth] mcp.post.error');
       if (!res.headersSent) res.status(500).json({ error: 'transport_error' });
     }
   });
@@ -3698,8 +3783,8 @@ export async function startHttp(opts = {}) {
     transport.lastSeen = Date.now();
     try {
       await transport.handleRequest(req, res);
-    } catch (e) {
-      console.error('MCP GET error', e);
+    } catch {
+      console.error('[oauth] mcp.get.error');
     }
   });
 
@@ -3710,8 +3795,8 @@ export async function startHttp(opts = {}) {
     transport.lastSeen = Date.now();
     try {
       await transport.handleRequest(req, res);
-    } catch (e) {
-      console.error('MCP DELETE error', e);
+    } catch {
+      console.error('[oauth] mcp.delete.error');
     }
   });
 

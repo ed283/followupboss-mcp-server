@@ -7,6 +7,9 @@ import { spawn } from 'child_process';
 import { createServer } from 'net';
 import { fileURLToPath } from 'url';
 import { dirname, resolve } from 'path';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { createHash, randomBytes } from 'crypto';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, '..');
@@ -78,8 +81,10 @@ async function waitForHealth(base, child) {
 }
 
 async function stop(child) {
-  if (child.exitCode === null) child.kill();
-  await new Promise(resolveExit => child.once('exit', resolveExit));
+  if (child.exitCode !== null) return;
+  const exited = new Promise(resolveExit => child.once('exit', resolveExit));
+  child.kill();
+  await exited;
 }
 
 const initRequest = {
@@ -92,6 +97,46 @@ const initRequest = {
     clientInfo: { name: 'http-auth-test', version: '1.0.0' }
   }
 };
+
+async function initializeMcp(base, accessToken) {
+  const response = await fetch(`${base}/mcp`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/event-stream',
+      Authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify(initRequest)
+  });
+  const body = await response.text();
+  assert.strictEqual(response.status, 200, 'OAuth access token must initialize MCP');
+  assert.match(body, /serverInfo/);
+  const sessionId = response.headers.get('mcp-session-id');
+  assert.ok(sessionId, 'MCP initialize must return a session ID');
+  return { sessionId, body };
+}
+
+async function listTools(base, accessToken, sessionId) {
+  const response = await fetch(`${base}/mcp`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/event-stream',
+      Authorization: `Bearer ${accessToken}`,
+      'Mcp-Session-Id': sessionId
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })
+  });
+  const body = await response.text();
+  assert.strictEqual(response.status, 200, 'OAuth access token must reach tools/list');
+  const normalized = body.replace(/\\"/g, '"');
+  const names = [...normalized.matchAll(/"name":"([^"]+)"/g)].map(match => match[1]);
+  assert.strictEqual(names.length, 60, 'OAuth tools/list must return exactly 60 tools');
+  assert.ok(names.includes('createNote'));
+  assert.ok(names.includes('createTask'));
+  assert.ok(!names.includes('createPerson'));
+  assert.ok(!names.includes('deletePerson'));
+}
 
 // HTTP mode must not start with no authentication configuration.
 {
@@ -160,6 +205,188 @@ const initRequest = {
   }
   assert.ok(!server.output().includes(FUB_TEST_KEY), 'server logs must not contain the FUB key');
   assert.ok(!server.output().includes(BEARER_TEST_TOKEN), 'server logs must not contain the bearer token');
+}
+
+// Complete OAuth flow: DCR, S256 PKCE, offline_access, token refresh rotation,
+// authenticated MCP discovery, and persistence across a server restart.
+{
+  const storeDirectory = await mkdtemp(resolve(tmpdir(), 'fub-mcp-oauth-'));
+  const storePath = resolve(storeDirectory, 'oauth-store.json');
+  const password = 'oauth_test_password';
+  const verifier = randomBytes(32).toString('base64url');
+  const challenge = createHash('sha256').update(verifier).digest('base64url');
+  const callback = 'https://chatgpt.example.test/oauth/callback';
+  let firstServer;
+  let secondServer;
+  let thirdServer;
+  let firstServerStopped = false;
+  let secondServerStopped = false;
+  let authorizationCode;
+  let originalTokens;
+  let refreshedTokens;
+  let output = '';
+  try {
+    const firstPort = await getOpenPort();
+    firstServer = launch(baseEnv(firstPort, {
+      MCP_AUTH_PASSWORD: password,
+      MCP_OAUTH_STORE_PATH: storePath
+    }));
+    const firstBase = `http://127.0.0.1:${firstPort}`;
+    await waitForHealth(firstBase, firstServer.child);
+
+    const metadata = await (await fetch(`${firstBase}/.well-known/oauth-authorization-server`)).json();
+    assert.ok(metadata.grant_types_supported.includes('authorization_code'));
+    assert.ok(metadata.grant_types_supported.includes('refresh_token'));
+    assert.ok(metadata.scopes_supported.includes('mcp'));
+    assert.ok(metadata.scopes_supported.includes('offline_access'));
+
+    const registration = await fetch(`${firstBase}/oauth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ redirect_uris: [callback], scope: 'mcp offline_access' })
+    });
+    assert.strictEqual(registration.status, 201, 'DCR registration must succeed');
+    const registered = await registration.json();
+    assert.ok(registered.grant_types.includes('refresh_token'));
+    assert.strictEqual(registered.scope, 'mcp offline_access');
+
+    const authorizeParams = new URLSearchParams({
+      client_id: registered.client_id,
+      redirect_uri: callback,
+      state: 'oauth-test-state',
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+      response_type: 'code',
+      scope: 'mcp offline_access'
+    });
+    const authorizeGet = await fetch(`${firstBase}/oauth/authorize?${authorizeParams}`, { redirect: 'manual' });
+    assert.strictEqual(authorizeGet.status, 200, 'authorization request must render the password form');
+
+    const authorizePost = await fetch(`${firstBase}/oauth/authorize`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ ...Object.fromEntries(authorizeParams), password })
+    });
+    assert.strictEqual(authorizePost.status, 302, 'valid password authorization must redirect');
+    authorizationCode = new URL(authorizePost.headers.get('location')).searchParams.get('code');
+    assert.ok(authorizationCode, 'authorization redirect must contain a code');
+
+    const tokenResponse = await fetch(`${firstBase}/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: authorizationCode,
+        redirect_uri: callback,
+        client_id: registered.client_id,
+        code_verifier: verifier
+      })
+    });
+    assert.strictEqual(tokenResponse.status, 200, 'PKCE token exchange must succeed');
+    originalTokens = await tokenResponse.json();
+    assert.ok(originalTokens.access_token);
+    assert.ok(originalTokens.refresh_token, 'offline_access must receive a refresh token');
+    assert.strictEqual(originalTokens.scope, 'mcp offline_access');
+
+    const firstSession = await initializeMcp(firstBase, originalTokens.access_token);
+    await listTools(firstBase, originalTokens.access_token, firstSession.sessionId);
+
+    const refreshResponse = await fetch(`${firstBase}/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: originalTokens.refresh_token,
+        client_id: registered.client_id
+      })
+    });
+    assert.strictEqual(refreshResponse.status, 200, 'refresh-token exchange must succeed');
+    refreshedTokens = await refreshResponse.json();
+    assert.ok(refreshedTokens.access_token);
+    assert.ok(refreshedTokens.refresh_token);
+    assert.notStrictEqual(refreshedTokens.refresh_token, originalTokens.refresh_token,
+      'refresh-token rotation must issue a new refresh token');
+
+    for (const refreshToken of [originalTokens.refresh_token, 'not-a-real-refresh-token']) {
+      const rejected = await fetch(`${firstBase}/oauth/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: registered.client_id })
+      });
+      assert.strictEqual(rejected.status, 400, 'reused or invalid refresh token must be rejected');
+      assert.strictEqual((await rejected.json()).error, 'invalid_grant');
+    }
+
+    await stop(firstServer.child);
+    firstServerStopped = true;
+    output += firstServer.output();
+
+    const secondPort = await getOpenPort();
+    secondServer = launch(baseEnv(secondPort, {
+      MCP_AUTH_PASSWORD: password,
+      MCP_OAUTH_STORE_PATH: storePath
+    }));
+    const secondBase = `http://127.0.0.1:${secondPort}`;
+    await waitForHealth(secondBase, secondServer.child);
+    const renewedSession = await initializeMcp(secondBase, refreshedTokens.access_token);
+    await listTools(secondBase, refreshedTokens.access_token, renewedSession.sessionId);
+
+    const persistedRefresh = await fetch(`${secondBase}/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refreshedTokens.refresh_token,
+        client_id: registered.client_id
+      })
+    });
+    assert.strictEqual(persistedRefresh.status, 200, 'persisted refresh token must work after restart');
+    const persistedTokens = await persistedRefresh.json();
+    const persistedSession = await initializeMcp(secondBase, persistedTokens.access_token);
+    assert.ok(persistedSession.sessionId, 'refreshed access token must initialize MCP after restart');
+
+    await stop(secondServer.child);
+    secondServerStopped = true;
+    const persistedStore = JSON.parse(await readFile(storePath, 'utf8'));
+    persistedStore.refreshTokens[persistedTokens.refresh_token].expires_at = Date.now() - 1;
+    await writeFile(storePath, JSON.stringify(persistedStore));
+
+    const thirdPort = await getOpenPort();
+    thirdServer = launch(baseEnv(thirdPort, {
+      MCP_AUTH_PASSWORD: password,
+      MCP_OAUTH_STORE_PATH: storePath
+    }));
+    const thirdBase = `http://127.0.0.1:${thirdPort}`;
+    await waitForHealth(thirdBase, thirdServer.child);
+    const expired = await fetch(`${thirdBase}/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: persistedTokens.refresh_token,
+        client_id: registered.client_id
+      })
+    });
+    assert.strictEqual(expired.status, 400, 'expired refresh token must be rejected');
+    assert.strictEqual((await expired.json()).error, 'invalid_grant');
+  } finally {
+    if (firstServer && !firstServerStopped) await stop(firstServer.child);
+    if (secondServer && !secondServerStopped) await stop(secondServer.child);
+    if (thirdServer?.child.exitCode === null) await stop(thirdServer.child);
+    output += firstServer?.output() || '';
+    output += secondServer?.output() || '';
+    output += thirdServer?.output() || '';
+    await rm(storeDirectory, { recursive: true, force: true });
+  }
+  for (const secret of [password, verifier, challenge, authorizationCode, originalTokens?.access_token,
+    originalTokens?.refresh_token, refreshedTokens?.access_token, refreshedTokens?.refresh_token].filter(Boolean)) {
+    assert.ok(!output.includes(secret), 'OAuth logs must not contain a test secret');
+  }
+  for (const event of ['dcr.request', 'dcr.success', 'authorize.get', 'authorize.post.success',
+    'token.authorization_code.request', 'token.refresh.request', 'mcp.initialize', 'mcp.tools.list']) {
+    assert.ok(output.includes(`[oauth] ${event}`), `sanitized log must include ${event}`);
+  }
 }
 
 console.log('http-auth: all checks passed');

@@ -57,9 +57,9 @@ clients and access tokens at `MCP_OAUTH_STORE_PATH`, which defaults to
 
 OAuth on Railway requires a persistent volume and an explicit path on that
 volume, for example `MCP_OAUTH_STORE_PATH=/data/oauth-store.json`. Without it,
-restart/redeploy loses clients and access tokens. The server's current OAuth
-metadata does not advertise refresh-token support, so confirm the ChatGPT
-Business OAuth requirements before choosing this mode.
+restart/redeploy loses clients, access tokens, and refresh tokens. OAuth
+advertises `mcp` and `offline_access`, supports refresh-token rotation, and
+persists the resulting credentials in that store.
 
 ## Smoke-test checklist
 
