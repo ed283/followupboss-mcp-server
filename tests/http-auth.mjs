@@ -4,21 +4,26 @@
  */
 import assert from 'assert';
 import { spawn } from 'child_process';
-import { createServer } from 'net';
+import { createServer as createNetServer } from 'net';
+import { createServer as createHttpServer } from 'http';
 import { fileURLToPath } from 'url';
 import { dirname, resolve } from 'path';
 import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { createHash, randomBytes } from 'crypto';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, '..');
 const FUB_TEST_KEY = 'fka_http_auth_test_key';
 const BEARER_TEST_TOKEN = 'mcp_http_auth_test_token';
+process.env.FUB_API_KEY = FUB_TEST_KEY;
+process.env.FUB_SAFE_MODE = 'true';
+const { createServer: createMcpServer } = await import('../index.js');
 
 function getOpenPort() {
   return new Promise((resolvePort, reject) => {
-    const server = createServer();
+    const server = createNetServer();
     server.once('error', reject);
     server.listen(0, '127.0.0.1', () => {
       const { port } = server.address();
@@ -87,12 +92,34 @@ async function stop(child) {
   await exited;
 }
 
+async function launchDirectTransport() {
+  let transport;
+  const server = createHttpServer(async (req, res) => {
+    if (!transport) {
+      const mcpServer = createMcpServer();
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomBytes(16).toString('hex')
+      });
+      await mcpServer.connect(transport);
+    }
+    await transport.handleRequest(req, res);
+  });
+  const port = await new Promise((resolvePort, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolvePort(server.address().port));
+  });
+  return {
+    base: `http://127.0.0.1:${port}`,
+    stop: () => new Promise((resolveStop, reject) => server.close(error => error ? reject(error) : resolveStop()))
+  };
+}
+
 const initRequest = {
   jsonrpc: '2.0',
   id: 1,
   method: 'initialize',
   params: {
-    protocolVersion: '2024-11-05',
+    protocolVersion: '2025-11-25',
     capabilities: {},
     clientInfo: { name: 'http-auth-test', version: '1.0.0' }
   }
@@ -169,6 +196,30 @@ async function sendInitializedNotification(base, accessToken, sessionId) {
   assert.strictEqual(await response.text(), '', 'notifications/initialized must not return a JSON-RPC body');
 }
 
+async function postMcp(base, accessToken, body) {
+  return fetch(`${base}/mcp`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/event-stream',
+      Authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify(body)
+  });
+}
+
+async function assertInitializeStatus(base, accessToken, body, expectedStatus, label) {
+  const response = await postMcp(base, accessToken, body);
+  const responseBody = await response.text();
+  assert.strictEqual(response.status, expectedStatus, label);
+  if (expectedStatus === 200) {
+    assert.strictEqual(parseSseJsonRpc(responseBody).result.protocolVersion, '2025-11-25');
+  } else {
+    const error = JSON.parse(responseBody).error;
+    assert.strictEqual(error.code, -32700, `${label}: must be JSON-RPC parse error`);
+  }
+}
+
 function assertStrictPublicClientRegistration(response, redirectUris, expectedScope) {
   const permittedFields = new Set([
     'client_id', 'client_id_issued_at', 'redirect_uris', 'grant_types',
@@ -192,6 +243,28 @@ function assertStrictPublicClientRegistration(response, redirectUris, expectedSc
   }
   assert.ok(!Object.hasOwn(response, 'client_secret'));
   assert.ok(!Object.hasOwn(response, 'client_secret_expires_at'));
+}
+
+// The same 2025-11-25 initialize succeeds when routed directly to the SDK
+// without Express. The production-route test below exercises express.json()
+// and handleRequest(req, res, req.body) separately.
+{
+  const direct = await launchDirectTransport();
+  try {
+    const response = await fetch(`${direct.base}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream'
+      },
+      body: JSON.stringify(initRequest)
+    });
+    assert.strictEqual(response.status, 200, 'direct SDK initialize must not return a parse error');
+    const message = parseSseJsonRpc(await response.text());
+    assert.strictEqual(message.result.protocolVersion, '2025-11-25');
+  } finally {
+    await direct.stop();
+  }
 }
 
 // HTTP mode must not start with no authentication configuration.
@@ -481,6 +554,45 @@ function assertStrictPublicClientRegistration(response, redirectUris, expectedSc
     await listTools(firstBase, originalTokens.access_token, secondSession.sessionId);
     await listTools(firstBase, originalTokens.access_token, firstSession.sessionId);
 
+    // Probe structural variants through the same Express route used in production.
+    // Each accepted initialize intentionally receives an independent session.
+    await assertInitializeStatus(firstBase, originalTokens.access_token, structuredClone(initRequest), 200,
+      'normal initialize object must succeed');
+    const extraCapabilities = structuredClone(initRequest);
+    extraCapabilities.params.capabilities = { experimental: { 'chatgpt/test': { enabled: true } } };
+    await assertInitializeStatus(firstBase, originalTokens.access_token, extraCapabilities, 200,
+      'initialize with additional capabilities must succeed');
+    const extraClientInfo = structuredClone(initRequest);
+    extraClientInfo.params.clientInfo.build = 'business';
+    await assertInitializeStatus(firstBase, originalTokens.access_token, extraClientInfo, 200,
+      'initialize with extra clientInfo fields must succeed');
+    const extraParams = structuredClone(initRequest);
+    extraParams.params.client_extension = { enabled: true };
+    await assertInitializeStatus(firstBase, originalTokens.access_token, extraParams, 200,
+      'initialize with additional params fields must succeed');
+    const topLevelExtra = structuredClone(initRequest);
+    topLevelExtra.client_extension = true;
+    await assertInitializeStatus(firstBase, originalTokens.access_token, topLevelExtra, 400,
+      'initialize with a top-level extra field must fail strict JSON-RPC validation');
+    await assertInitializeStatus(firstBase, originalTokens.access_token, [structuredClone(initRequest)], 200,
+      'single-message JSON-RPC batch containing initialize must succeed');
+    const nullParams = structuredClone(initRequest);
+    nullParams.params = null;
+    await assertInitializeStatus(firstBase, originalTokens.access_token, nullParams, 400,
+      'initialize with null params must fail JSON-RPC validation');
+    const nullId = structuredClone(initRequest);
+    nullId.id = null;
+    await assertInitializeStatus(firstBase, originalTokens.access_token, nullId, 400,
+      'initialize with null id must fail JSON-RPC validation');
+    const numericId = structuredClone(initRequest);
+    numericId.id = 8675309;
+    await assertInitializeStatus(firstBase, originalTokens.access_token, numericId, 200,
+      'initialize with integer request ID must succeed');
+    const stringId = structuredClone(initRequest);
+    stringId.id = 'chatgpt-initialize-α';
+    await assertInitializeStatus(firstBase, originalTokens.access_token, stringId, 200,
+      'initialize with string request ID must succeed');
+
     const refreshResponse = await fetch(`${firstBase}/oauth/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -591,6 +703,7 @@ function assertStrictPublicClientRegistration(response, redirectUris, expectedSc
     assert.ok(output.includes(`[oauth] ${event}`), `sanitized log must include ${event}`);
   }
   for (const event of ['request.received', 'response.sent', 'initialize.received',
+    'initialize.structure', 'initialize.validation_passed', 'initialize.validation_failed',
     'initialized_notification.received', 'tools_list.received']) {
     assert.ok(output.includes(`[mcp-http] ${event}`), `handshake diagnostic must include ${event}`);
   }

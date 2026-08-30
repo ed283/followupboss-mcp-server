@@ -21,7 +21,6 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { CallToolRequestSchema, ListToolsRequestSchema, LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from '@modelcontextprotocol/sdk/types.js';
 import axios from 'axios';
 import express from 'express';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'fs';
@@ -3405,6 +3404,89 @@ export async function startHttp(opts = {}) {
     return sessionId ? createHash('sha256').update(String(sessionId)).digest('hex').slice(0, 12) : undefined;
   }
 
+  function valueType(value) {
+    if (value === null) return 'null';
+    if (Array.isArray(value)) return 'array';
+    return typeof value;
+  }
+
+  function objectKeys(value) {
+    return value && typeof value === 'object' && !Array.isArray(value) ? Object.keys(value) : [];
+  }
+
+  function valueTypesByKey(value, depth = 1) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return valueType(value);
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [
+      key,
+      depth > 0 && child && typeof child === 'object' && !Array.isArray(child)
+        ? valueTypesByKey(child, depth - 1)
+        : valueType(child)
+    ]));
+  }
+
+  function valueAtPath(value, path) {
+    return path.reduce((current, key) => current == null ? undefined : current[key], value);
+  }
+
+  function logInitializeStructure(body) {
+    const params = body?.params;
+    const capabilities = params?.capabilities;
+    const clientInfo = params?.clientInfo;
+    logMcpHttpEvent('initialize.structure', {
+      top_level_type: valueType(body),
+      is_array: Array.isArray(body),
+      top_level_keys: objectKeys(body),
+      extra_top_level_keys: objectKeys(body).filter(key => !['jsonrpc', 'id', 'method', 'params'].includes(key)),
+      jsonrpc: body?.jsonrpc ?? null,
+      id_type: valueType(body?.id),
+      method: body?.method ?? null,
+      params_type: valueType(params),
+      params_keys: objectKeys(params),
+      extra_params: Object.fromEntries(objectKeys(params)
+        .filter(key => !['protocolVersion', 'capabilities', 'clientInfo'].includes(key))
+        .map(key => [key, valueType(params[key])])),
+      protocol_version: params?.protocolVersion ?? null,
+      capabilities_type: valueType(capabilities),
+      capabilities_keys: objectKeys(capabilities),
+      capabilities_value_types: valueTypesByKey(capabilities, 2),
+      client_info_type: valueType(clientInfo),
+      client_info_keys: objectKeys(clientInfo),
+      client_info_name: clientInfo?.name ?? null,
+      client_info_version: clientInfo?.version ?? null,
+      client_info_extra_fields: Object.fromEntries(objectKeys(clientInfo)
+        .filter(key => !['name', 'version'].includes(key))
+        .map(key => [key, valueType(clientInfo[key])]))
+    });
+  }
+
+  function logJsonRpcValidation(body) {
+    const messages = Array.isArray(body) ? body : [body];
+    const issues = [];
+    messages.forEach((message, index) => {
+      const result = JSONRPCMessageSchema.safeParse(message);
+      if (!result.success) {
+        for (const issue of result.error.issues) {
+          const path = Array.isArray(body) ? [index, ...issue.path] : issue.path;
+          issues.push({
+            path: path.map(String).join('.') || '(root)',
+            expected: issue.expected ?? issue.code,
+            received_type: valueType(valueAtPath(Array.isArray(body) ? body : message, Array.isArray(body) ? path.slice(1) : issue.path)),
+            issue_code: issue.code
+          });
+        }
+      }
+    });
+    if (issues.length) {
+      logMcpHttpEvent('initialize.validation_failed', {
+        error_name: 'ZodError',
+        error_message: 'JSONRPCMessageSchema validation failed',
+        issues
+      });
+    } else {
+      logMcpHttpEvent('initialize.validation_passed', { message_count: messages.length });
+    }
+  }
+
   function observeRejectedMcpResponse(req, res) {
     res.once('finish', () => {
       logMcpHttpEvent('response.sent', {
@@ -3974,6 +4056,8 @@ export async function startHttp(opts = {}) {
     }
     transport.lastSeen = Date.now();
     if (rpcMethod === 'initialize') {
+      logInitializeStructure(req.body);
+      logJsonRpcValidation(req.body);
       const requestedProtocolVersion = req.body?.params?.protocolVersion ?? null;
       const returnedProtocolVersion = SUPPORTED_PROTOCOL_VERSIONS.includes(requestedProtocolVersion)
         ? requestedProtocolVersion : LATEST_PROTOCOL_VERSION;
