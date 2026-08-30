@@ -3394,6 +3394,19 @@ export async function startHttp(opts = {}) {
     console.error(`[oauth] ${event}`);
   }
 
+  // RFC 8707 resource indicators bind tokens to this MCP endpoint. Do not
+  // derive this from an untrusted resource parameter: the protected resource
+  // is always this server's canonical /mcp URL.
+  function canonicalResource(req) {
+    return `${baseUrl(req)}/mcp`;
+  }
+
+  function parseResource(resource, req) {
+    if (resource === undefined || resource === null) return canonicalResource(req);
+    if (typeof resource !== 'string' || resource !== canonicalResource(req)) return null;
+    return resource;
+  }
+
   function loadOAuthStore() {
     try {
       if (!existsSync(OAUTH_STORE_PATH)) return { clients: {}, accessTokens: {}, refreshTokens: {} };
@@ -3440,10 +3453,10 @@ export async function startHttp(opts = {}) {
     return [...requested].sort().join(' ');
   }
 
-  function issueTokens(clientId, scope, includeRefreshToken) {
+  function issueTokens(clientId, scope, resource, includeRefreshToken) {
     const access_token = randomBytes(32).toString('hex');
     const expires_at = Date.now() + ACCESS_TOKEN_TTL_MS;
-    accessTokens.set(access_token, { client_id: clientId, expires_at });
+    accessTokens.set(access_token, { client_id: clientId, resource, expires_at });
     const response = {
       access_token,
       token_type: 'Bearer',
@@ -3455,6 +3468,7 @@ export async function startHttp(opts = {}) {
       refreshTokens.set(refresh_token, {
         client_id: clientId,
         scope,
+        resource,
         expires_at: Date.now() + REFRESH_TOKEN_TTL_MS
       });
       response.refresh_token = refresh_token;
@@ -3503,9 +3517,9 @@ export async function startHttp(opts = {}) {
     });
   });
 
-  // OAuth 2.1 metadata (RFC 8414). Claude's custom connector reads this to
-  // discover the authorize / token / register endpoints.
+  // OAuth 2.1 authorization-server metadata (RFC 8414).
   app.get('/.well-known/oauth-authorization-server', (req, res) => {
+    logAuthEvent('metadata.authorization_server.get');
     const base = baseUrl(req);
     res.json({
       issuer: base,
@@ -3520,21 +3534,30 @@ export async function startHttp(opts = {}) {
     });
   });
 
-  // MCP resource metadata (RFC 9728) — lets clients discover the AS for this resource.
-  app.get('/.well-known/oauth-protected-resource', (req, res) => {
+  // RFC 9728 requires resource metadata at a path-specific URL when the
+  // resource is not the origin root: /.well-known/oauth-protected-resource/mcp.
+  // Keep the root path as a compatibility alias for older MCP clients.
+  const protectedResourceMetadata = (req, res) => {
+    logAuthEvent('metadata.protected_resource.get');
     const base = baseUrl(req);
     res.json({
       resource: `${base}/mcp`,
       authorization_servers: [base],
       scopes_supported: ['mcp', 'offline_access']
     });
-  });
+  };
+  app.get('/.well-known/oauth-protected-resource/mcp', protectedResourceMetadata);
+  app.get('/.well-known/oauth-protected-resource', protectedResourceMetadata);
 
   // OAuth: Dynamic Client Registration (RFC 7591). Claude registers itself
   // dynamically; we hand back a client_id with no secret (public client).
   app.post('/oauth/register', (req, res) => {
     if (!OAUTH_ENABLED) return res.status(404).json({ error: 'oauth_disabled' });
     logAuthEvent('dcr.request');
+    // Parameter names only: redirect URIs and client metadata are not logged.
+    logAuthEvent('dcr.params.redirect_uris');
+    if (req.body?.grant_types !== undefined) logAuthEvent('dcr.params.grant_types');
+    if (req.body?.response_types !== undefined) logAuthEvent('dcr.params.response_types');
     const redirect_uris = Array.isArray(req.body?.redirect_uris) ? req.body.redirect_uris : [];
     if (!redirect_uris.length) {
       return res.status(400).json({ error: 'invalid_redirect_uri', error_description: 'redirect_uris is required' });
@@ -3565,8 +3588,10 @@ export async function startHttp(opts = {}) {
   app.get('/oauth/authorize', (req, res) => {
     if (!OAUTH_ENABLED) return res.status(404).send('OAuth disabled');
     logAuthEvent('authorize.get');
+    logAuthEvent('authorize.params.client_id,redirect_uri,response_type,code_challenge,code_challenge_method,scope,resource');
     const { client_id, redirect_uri, state, code_challenge, code_challenge_method, response_type } = req.query;
     const scope = parseScope(req.query.scope);
+    const resource = parseResource(req.query.resource, req);
     const client = clients.get(client_id);
     if (!client) return res.status(400).send('Invalid client_id');
     if (!client.redirect_uris.includes(redirect_uri)) return res.status(400).send('redirect_uri not registered');
@@ -3574,6 +3599,7 @@ export async function startHttp(opts = {}) {
     if (code_challenge_method !== 'S256') return res.status(400).send('Only S256 PKCE supported');
     if (!code_challenge) return res.status(400).send('code_challenge required');
     if (!scope) return res.status(400).send('invalid_scope');
+    if (!resource) return res.status(400).send('invalid_target');
 
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(`<!DOCTYPE html>
@@ -3601,6 +3627,7 @@ export async function startHttp(opts = {}) {
     <input type="hidden" name="state" value="${esc(state || '')}">
     <input type="hidden" name="code_challenge" value="${esc(code_challenge)}">
     <input type="hidden" name="scope" value="${esc(scope)}">
+    <input type="hidden" name="resource" value="${esc(resource)}">
     <label for="pw">Password</label>
     <input id="pw" name="password" type="password" autocomplete="current-password" autofocus required>
     <button type="submit">Authorize</button>
@@ -3614,17 +3641,18 @@ export async function startHttp(opts = {}) {
     logAuthEvent('authorize.post');
     const { client_id, redirect_uri, state, code_challenge, password } = req.body;
     const scope = parseScope(req.body.scope);
+    const resource = parseResource(req.body.resource, req);
     const client = clients.get(client_id);
-    if (!client || !client.redirect_uris.includes(redirect_uri) || !scope) {
+    if (!client || !client.redirect_uris.includes(redirect_uri) || !scope || !resource) {
       logAuthEvent('authorize.post.failure');
-      return res.status(400).send(!scope ? 'invalid_scope' : 'Invalid client_id or redirect_uri');
+      return res.status(400).send(!scope ? 'invalid_scope' : (!resource ? 'invalid_target' : 'Invalid client_id or redirect_uri'));
     }
 
     if (!password || !constantTimeEq(password, AUTH_PASSWORD)) {
       logAuthEvent('authorize.post.failure');
       const q = new URLSearchParams({
       client_id, redirect_uri, state: state || '', code_challenge,
-        code_challenge_method: 'S256', response_type: 'code', scope,
+        code_challenge_method: 'S256', response_type: 'code', scope, resource,
         err: 'Wrong password.'
       });
       return res.redirect(`/oauth/authorize?${q.toString()}`);
@@ -3633,7 +3661,7 @@ export async function startHttp(opts = {}) {
     const code = randomBytes(32).toString('hex');
     authCodes.set(code, {
       client_id, redirect_uri, code_challenge,
-      scope,
+      scope, resource,
       expires_at: Date.now() + AUTH_CODE_TTL_MS
     });
     logAuthEvent('authorize.post.success');
@@ -3648,6 +3676,7 @@ export async function startHttp(opts = {}) {
   app.post('/oauth/token', (req, res) => {
     if (!OAUTH_ENABLED) return res.status(404).json({ error: 'oauth_disabled' });
     const { grant_type, code, redirect_uri, client_id, code_verifier, refresh_token } = req.body;
+    // Grant-type event names intentionally reveal no request values.
     if (grant_type === 'authorization_code') {
       logAuthEvent('token.authorization_code.request');
       const entry = authCodes.get(code);
@@ -3658,6 +3687,8 @@ export async function startHttp(opts = {}) {
       }
       if (entry.client_id !== client_id) return res.status(400).json({ error: 'invalid_grant', error_description: 'client_id mismatch' });
       if (entry.redirect_uri !== redirect_uri) return res.status(400).json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch' });
+      const resource = parseResource(req.body.resource, req);
+      if (!resource || resource !== entry.resource) return res.status(400).json({ error: 'invalid_target' });
       if (!code_verifier) return res.status(400).json({ error: 'invalid_request', error_description: 'code_verifier required' });
 
       const expectedChallenge = createHash('sha256').update(code_verifier).digest('base64url');
@@ -3666,7 +3697,7 @@ export async function startHttp(opts = {}) {
       }
 
       authCodes.delete(code);
-      const tokens = issueTokens(client_id, entry.scope, entry.scope.includes('offline_access'));
+      const tokens = issueTokens(client_id, entry.scope, entry.resource, entry.scope.includes('offline_access'));
       if (!saveOAuthStore()) {
         accessTokens.delete(tokens.access_token);
         if (tokens.refresh_token) refreshTokens.delete(tokens.refresh_token);
@@ -3679,12 +3710,13 @@ export async function startHttp(opts = {}) {
     if (grant_type === 'refresh_token') {
       logAuthEvent('token.refresh.request');
       const entry = refreshTokens.get(refresh_token);
-      if (!entry || entry.expires_at < Date.now() || (client_id && entry.client_id !== client_id)) {
+      const resource = parseResource(req.body.resource, req);
+      if (!entry || !resource || (entry.resource && resource !== entry.resource) || entry.expires_at < Date.now() || (client_id && entry.client_id !== client_id)) {
         if (entry?.expires_at < Date.now()) refreshTokens.delete(refresh_token);
         return res.status(400).json({ error: 'invalid_grant' });
       }
       refreshTokens.delete(refresh_token);
-      const tokens = issueTokens(entry.client_id, entry.scope, true);
+      const tokens = issueTokens(entry.client_id, entry.scope, entry.resource || resource, true);
       if (!saveOAuthStore()) {
         accessTokens.delete(tokens.access_token);
         refreshTokens.delete(tokens.refresh_token);
@@ -3700,21 +3732,25 @@ export async function startHttp(opts = {}) {
   // Auth middleware protecting /mcp.
   const wwwAuthenticateHeader = (req) => {
     const base = baseUrl(req);
-    return `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource"`;
+    return `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/mcp"`;
   };
 
   const requireAuth = (req, res, next) => {
     if (AUTH_DISABLED) return next();
     const header = req.headers['authorization'] || '';
     if (!header.startsWith('Bearer ')) {
+      logAuthEvent('mcp.unauthenticated.request');
       res.set('WWW-Authenticate', wwwAuthenticateHeader(req));
+      logAuthEvent('mcp.unauthenticated.response.401.www_authenticate');
       return res.status(401).json({ error: 'unauthorized' });
     }
     const token = header.slice(7).trim();
     if (OAUTH_ENABLED) {
       const entry = accessTokens.get(token);
       if (!entry || entry.expires_at < Date.now()) {
+        logAuthEvent('mcp.unauthenticated.request');
         res.set('WWW-Authenticate', wwwAuthenticateHeader(req));
+        logAuthEvent('mcp.unauthenticated.response.401.www_authenticate');
         return res.status(401).json({ error: 'unauthorized' });
       }
       return next();

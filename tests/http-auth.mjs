@@ -233,8 +233,29 @@ async function listTools(base, accessToken, sessionId) {
     }));
     const firstBase = `http://127.0.0.1:${firstPort}`;
     await waitForHealth(firstBase, firstServer.child);
+    const resource = `${firstBase}/mcp`;
 
-    const metadata = await (await fetch(`${firstBase}/.well-known/oauth-authorization-server`)).json();
+    // An MCP client can begin with an unauthenticated request, read the
+    // challenge, then follow the RFC 9728 metadata chain to the AS.
+    const unauthenticated = await fetch(`${firstBase}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream' },
+      body: JSON.stringify(initRequest)
+    });
+    assert.strictEqual(unauthenticated.status, 401, 'unauthenticated MCP request must be rejected');
+    const challengeHeader = unauthenticated.headers.get('www-authenticate');
+    assert.strictEqual(challengeHeader,
+      `Bearer resource_metadata="${firstBase}/.well-known/oauth-protected-resource/mcp"`);
+    const resourceMetadataUrl = challengeHeader.match(/resource_metadata="([^"]+)"/)[1];
+    const protectedMetadata = await (await fetch(resourceMetadataUrl)).json();
+    assert.strictEqual(protectedMetadata.resource, resource);
+    assert.deepStrictEqual(protectedMetadata.authorization_servers, [firstBase]);
+    assert.ok(protectedMetadata.scopes_supported.includes('mcp'));
+    // Keep the origin-level endpoint for compatibility, but assert the
+    // path-specific endpoint is the one advertised in the challenge.
+    const rootProtectedMetadata = await (await fetch(`${firstBase}/.well-known/oauth-protected-resource`)).json();
+    assert.deepStrictEqual(rootProtectedMetadata, protectedMetadata);
+    const metadata = await (await fetch(`${protectedMetadata.authorization_servers[0]}/.well-known/oauth-authorization-server`)).json();
     assert.ok(metadata.grant_types_supported.includes('authorization_code'));
     assert.ok(metadata.grant_types_supported.includes('refresh_token'));
     assert.ok(metadata.scopes_supported.includes('mcp'));
@@ -243,12 +264,19 @@ async function listTools(base, accessToken, sessionId) {
     const registration = await fetch(`${firstBase}/oauth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ redirect_uris: [callback], scope: 'mcp offline_access' })
+      body: JSON.stringify({
+        redirect_uris: [callback],
+        grant_types: ['authorization_code', 'refresh_token'],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'none',
+        scope: 'mcp offline_access'
+      })
     });
     assert.strictEqual(registration.status, 201, 'DCR registration must succeed');
     const registered = await registration.json();
     assert.ok(registered.grant_types.includes('refresh_token'));
     assert.strictEqual(registered.scope, 'mcp offline_access');
+    assert.deepStrictEqual(registered.redirect_uris, [callback], 'DCR must preserve the exact redirect URI');
 
     const authorizeParams = new URLSearchParams({
       client_id: registered.client_id,
@@ -257,8 +285,14 @@ async function listTools(base, accessToken, sessionId) {
       code_challenge: challenge,
       code_challenge_method: 'S256',
       response_type: 'code',
-      scope: 'mcp offline_access'
+      scope: 'mcp offline_access',
+      resource
     });
+    const invalidResource = new URLSearchParams(authorizeParams);
+    invalidResource.set('resource', `${firstBase}/not-mcp`);
+    const invalidResourceResponse = await fetch(`${firstBase}/oauth/authorize?${invalidResource}`);
+    assert.strictEqual(invalidResourceResponse.status, 400, 'authorization must reject a token target other than /mcp');
+    assert.strictEqual(await invalidResourceResponse.text(), 'invalid_target');
     const authorizeGet = await fetch(`${firstBase}/oauth/authorize?${authorizeParams}`, { redirect: 'manual' });
     assert.strictEqual(authorizeGet.status, 200, 'authorization request must render the password form');
 
@@ -280,7 +314,8 @@ async function listTools(base, accessToken, sessionId) {
         code: authorizationCode,
         redirect_uri: callback,
         client_id: registered.client_id,
-        code_verifier: verifier
+        code_verifier: verifier,
+        resource
       })
     });
     assert.strictEqual(tokenResponse.status, 200, 'PKCE token exchange must succeed');
@@ -298,7 +333,8 @@ async function listTools(base, accessToken, sessionId) {
       body: new URLSearchParams({
         grant_type: 'refresh_token',
         refresh_token: originalTokens.refresh_token,
-        client_id: registered.client_id
+        client_id: registered.client_id,
+        resource
       })
     });
     assert.strictEqual(refreshResponse.status, 200, 'refresh-token exchange must succeed');
@@ -312,7 +348,7 @@ async function listTools(base, accessToken, sessionId) {
       const rejected = await fetch(`${firstBase}/oauth/token`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: registered.client_id })
+        body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: registered.client_id, resource })
       });
       assert.strictEqual(rejected.status, 400, 'reused or invalid refresh token must be rejected');
       assert.strictEqual((await rejected.json()).error, 'invalid_grant');
@@ -322,7 +358,7 @@ async function listTools(base, accessToken, sessionId) {
     firstServerStopped = true;
     output += firstServer.output();
 
-    const secondPort = await getOpenPort();
+    const secondPort = firstPort;
     secondServer = launch(baseEnv(secondPort, {
       MCP_AUTH_PASSWORD: password,
       MCP_OAUTH_STORE_PATH: storePath
@@ -338,7 +374,8 @@ async function listTools(base, accessToken, sessionId) {
       body: new URLSearchParams({
         grant_type: 'refresh_token',
         refresh_token: refreshedTokens.refresh_token,
-        client_id: registered.client_id
+        client_id: registered.client_id,
+        resource
       })
     });
     assert.strictEqual(persistedRefresh.status, 200, 'persisted refresh token must work after restart');
@@ -352,7 +389,7 @@ async function listTools(base, accessToken, sessionId) {
     persistedStore.refreshTokens[persistedTokens.refresh_token].expires_at = Date.now() - 1;
     await writeFile(storePath, JSON.stringify(persistedStore));
 
-    const thirdPort = await getOpenPort();
+    const thirdPort = firstPort;
     thirdServer = launch(baseEnv(thirdPort, {
       MCP_AUTH_PASSWORD: password,
       MCP_OAUTH_STORE_PATH: storePath
@@ -365,7 +402,8 @@ async function listTools(base, accessToken, sessionId) {
       body: new URLSearchParams({
         grant_type: 'refresh_token',
         refresh_token: persistedTokens.refresh_token,
-        client_id: registered.client_id
+        client_id: registered.client_id,
+        resource
       })
     });
     assert.strictEqual(expired.status, 400, 'expired refresh token must be rejected');
@@ -383,7 +421,10 @@ async function listTools(base, accessToken, sessionId) {
     originalTokens?.refresh_token, refreshedTokens?.access_token, refreshedTokens?.refresh_token].filter(Boolean)) {
     assert.ok(!output.includes(secret), 'OAuth logs must not contain a test secret');
   }
-  for (const event of ['dcr.request', 'dcr.success', 'authorize.get', 'authorize.post.success',
+  for (const event of ['metadata.authorization_server.get', 'metadata.protected_resource.get',
+    'mcp.unauthenticated.request', 'mcp.unauthenticated.response.401.www_authenticate',
+    'dcr.request', 'dcr.params.redirect_uris', 'dcr.params.grant_types', 'dcr.params.response_types',
+    'authorize.get', 'authorize.params.client_id,redirect_uri,response_type,code_challenge,code_challenge_method,scope,resource', 'authorize.post.success',
     'token.authorization_code.request', 'token.refresh.request', 'mcp.initialize', 'mcp.tools.list']) {
     assert.ok(output.includes(`[oauth] ${event}`), `sanitized log must include ${event}`);
   }
