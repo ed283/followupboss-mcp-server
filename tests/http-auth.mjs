@@ -22,6 +22,13 @@ process.env.FUB_API_KEY = FUB_TEST_KEY;
 process.env.FUB_SAFE_MODE = 'true';
 const { createServer: createMcpServer } = await import('../index.js');
 
+// SDK 1.30.0's Streamable HTTP transport calls globalThis.crypto.randomUUID()
+// while creating its response stream. Node 20 supplies this Web Crypto global.
+const manifest = JSON.parse(await readFile(resolve(root, 'package.json'), 'utf8'));
+assert.strictEqual(manifest.engines.node, '22.x', 'production runtime must be pinned to Node 22');
+assert.notStrictEqual(typeof globalThis.crypto, 'undefined', 'runtime must provide global Web Crypto');
+assert.strictEqual(typeof globalThis.crypto.randomUUID, 'function', 'runtime must provide crypto.randomUUID');
+
 function getOpenPort() {
   return new Promise((resolvePort, reject) => {
     const server = createNetServer();
