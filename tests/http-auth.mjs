@@ -405,6 +405,22 @@ function assertStrictPublicClientRegistration(response, redirectUris, expectedSc
     assert.ok(originalTokens.refresh_token, 'offline_access must receive a refresh token');
     assert.strictEqual(originalTokens.scope, 'mcp offline_access');
 
+    const discover = await fetch(`${firstBase}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        Authorization: `Bearer ${originalTokens.access_token}`
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 88, method: 'server/discover' })
+    });
+    assert.strictEqual(discover.status, 400, 'unsupported server/discover must be rejected before initialization');
+    const discoverError = await discover.json();
+    assert.strictEqual(discoverError.error.code, -32000);
+    assert.strictEqual(discoverError.error.message, 'Bad Request: Server not initialized');
+    const undiscoveredHealth = await (await fetch(`${firstBase}/health`)).json();
+    assert.strictEqual(undiscoveredHealth.sessions, 0, 'failed server/discover must not create a persisted session');
+
     const firstSession = await initializeMcp(firstBase, originalTokens.access_token);
     mcpSessionId = firstSession.sessionId;
     const activeHealth = await (await fetch(`${firstBase}/health`)).json();
@@ -452,6 +468,17 @@ function assertStrictPublicClientRegistration(response, redirectUris, expectedSc
     });
     assert.strictEqual(invalidSession.status, 404, 'unknown session ID must be rejected as not found');
     assert.strictEqual((await invalidSession.json()).error.code, -32001);
+    await listTools(firstBase, originalTokens.access_token, firstSession.sessionId);
+
+    // A reconnect is a new client session: a second initialize without a
+    // session header must receive an independent transport, not reuse Client A.
+    const secondSession = await initializeMcp(firstBase, originalTokens.access_token);
+    assert.notStrictEqual(secondSession.sessionId, firstSession.sessionId,
+      'two initialize requests must create distinct session IDs');
+    const twoSessionHealth = await (await fetch(`${firstBase}/health`)).json();
+    assert.strictEqual(twoSessionHealth.sessions, 2, 'both initialized sessions must remain available');
+    await sendInitializedNotification(firstBase, originalTokens.access_token, secondSession.sessionId);
+    await listTools(firstBase, originalTokens.access_token, secondSession.sessionId);
     await listTools(firstBase, originalTokens.access_token, firstSession.sessionId);
 
     const refreshResponse = await fetch(`${firstBase}/oauth/token`, {
@@ -567,6 +594,8 @@ function assertStrictPublicClientRegistration(response, redirectUris, expectedSc
     'initialized_notification.received', 'tools_list.received']) {
     assert.ok(output.includes(`[mcp-http] ${event}`), `handshake diagnostic must include ${event}`);
   }
+  assert.match(output, /\[mcp-http\] response\.error \{.*"status":400/,
+    'non-2xx MCP responses must record a sanitized diagnostic');
 }
 
 console.log('http-auth: all checks passed');

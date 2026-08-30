@@ -3900,6 +3900,20 @@ export async function startHttp(opts = {}) {
   sweeper.unref();
 
   function observeMcpResponse(req, res, details, getSessionId = () => undefined) {
+    let responseBody = '';
+    const capture = (chunk) => {
+      if (chunk && responseBody.length < 4096) responseBody += Buffer.from(chunk).toString('utf8').slice(0, 4096 - responseBody.length);
+    };
+    const originalWrite = res.write.bind(res);
+    const originalEnd = res.end.bind(res);
+    res.write = function patchedWrite(chunk, ...args) {
+      capture(chunk);
+      return originalWrite(chunk, ...args);
+    };
+    res.end = function patchedEnd(chunk, ...args) {
+      capture(chunk);
+      return originalEnd(chunk, ...args);
+    };
     logMcpHttpEvent('request.received', details);
     res.once('finish', () => {
       const sessionId = getSessionId();
@@ -3910,6 +3924,23 @@ export async function startHttp(opts = {}) {
         session_fingerprint: sessionFingerprint(sessionId),
         sessions: transports.size
       });
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        let errorCode = null;
+        let errorMessage = null;
+        try {
+          const body = JSON.parse(responseBody);
+          errorCode = body?.error?.code ?? null;
+          errorMessage = body?.error?.message ?? body?.error ?? null;
+        } catch {
+          // Only structured JSON-RPC error fields are diagnostic-safe to log.
+        }
+        logMcpHttpEvent('response.error', {
+          rpc_method: details.rpc_method,
+          status: res.statusCode,
+          jsonrpc_error_code: errorCode,
+          jsonrpc_error_message: errorMessage
+        });
+      }
     });
   }
 
